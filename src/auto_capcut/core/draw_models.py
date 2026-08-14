@@ -64,6 +64,69 @@ class DrawActionType(str, Enum):
     SETTLE = "SETTLE"
 
 
+class CameraActionType(str, Enum):
+    FOCUS = "focus"
+    PAN_TO = "pan_to"
+    PULL_TO = "pull_to"
+    FULL_VIEW = "full_view"
+
+
+class CameraFramingMode(str, Enum):
+    CAMERA_FRAME = "camera_frame"
+    OBJECT_FRAME = "object_frame"
+    OBJECT_BOX = "object_box"
+
+
+class CameraEasing(str, Enum):
+    EASE_IN_OUT = "ease_in_out"
+    LINEAR = "linear"
+
+
+@dataclass(frozen=True)
+class CameraState:
+    viewport: tuple[float, float, float, float]  # (x, y, w, h) in normalized [0, 1]
+
+    @property
+    def x(self) -> float:
+        return self.viewport[0]
+
+    @property
+    def y(self) -> float:
+        return self.viewport[1]
+
+    @property
+    def w(self) -> float:
+        return self.viewport[2]
+
+    @property
+    def h(self) -> float:
+        return self.viewport[3]
+
+    @property
+    def center_x(self) -> float:
+        return self.viewport[0] + self.viewport[2] / 2.0
+
+    @property
+    def center_y(self) -> float:
+        return self.viewport[1] + self.viewport[3] / 2.0
+
+    @property
+    def scale(self) -> float:
+        return 1.0 / max(1e-6, self.viewport[2])
+
+
+@dataclass(frozen=True)
+class CameraAfterDirective:
+    object_id: str
+    action: str
+    target: str = ""
+    duration_us: int | None = None
+    duration_mode: str = "auto"
+    hold_us: int = 0
+    framing: str = "camera_frame"
+    easing: str = "ease_in_out"
+
+
 @dataclass(frozen=True)
 class DrawAction:
     type: DrawActionType
@@ -88,6 +151,7 @@ class DrawImagePlan:
     objects: str
     actions: tuple[DrawAction, ...]
     object_effects: tuple["ObjectEffectOverride", ...] = ()
+    camera_after: tuple[CameraAfterDirective, ...] = ()
 
     @property
     def duration_us(self) -> int:

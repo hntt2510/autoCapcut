@@ -7,6 +7,10 @@ from auto_capcut.core.draw_models import (
     DrawAction,
     DrawActionType,
     DrawEffectFile,
+    CameraAfterDirective,
+    DrawAction,
+    DrawActionType,
+    DrawEffectFile,
     DrawImagePlan,
     DrawMode,
     DrawStyle,
@@ -20,6 +24,7 @@ _HEADER = re.compile(r"^([A-Za-z][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$")
 _SPACE_HEADER = re.compile(r"^(MODE|STYLE|OBJECTS)\s+(.+?)\s*$", re.IGNORECASE)
 _BLOCK_HEADER = re.compile(r"^Image\s+(\d+)\s+DRAW$", re.IGNORECASE)
 _OBJECT_EFFECT = re.compile(r"^OBJECT_EFFECT\s*:?\s*(.*)$", re.IGNORECASE)
+_CAMERA_AFTER = re.compile(r"^CAMERA_AFTER\s*:?\s*(.*)$", re.IGNORECASE)
 _ACTION = re.compile(
     r"^([A-Z_]+)\s+(\d+(?:\.\d+)?)s\s*(?:-|–|—)\s*(\d+(?:\.\d+)?)s\s*:\s*(.*)$",
     re.IGNORECASE,
@@ -139,6 +144,46 @@ def _parse_object_effect(line: str, image_index: int) -> ObjectEffectOverride:
     return ObjectEffectOverride(target, effect, direction, duration_us, pause_after_us, duration_mode)
 
 
+def _parse_camera_after(line: str, image_index: int) -> CameraAfterDirective:
+    match = _CAMERA_AFTER.fullmatch(line.strip())
+    if not match:
+        raise DrawParseError(f"Image {image_index}: malformed CAMERA_AFTER directive")
+    params = _properties(match.group(1).strip(), image_index, "CAMERA_AFTER")
+    allowed = {"object", "action", "target", "duration", "hold", "framing", "easing"}
+    unknown = sorted(set(params) - allowed)
+    if unknown:
+        raise DrawParseError(f"Image {image_index} CAMERA_AFTER: unsupported parameter(s): {', '.join(unknown)}")
+    object_id = params.get("object", "").strip()
+    action = params.get("action", "").casefold()
+    if not object_id:
+        raise DrawParseError(f"Image {image_index} CAMERA_AFTER requires object")
+    if action not in {"focus", "pan_to", "pull_to", "full_view"}:
+        raise DrawParseError(f"Image {image_index} CAMERA_AFTER object {object_id}: invalid action {params.get('action', '')}")
+    target = params.get("target", "").strip()
+    if not target and action in {"focus", "pan_to", "pull_to"}:
+        target = object_id
+    duration_us = None
+    duration_mode = "auto"
+    if "duration" in params:
+        if params["duration"].casefold() == "auto":
+            duration_mode = "auto"
+        else:
+            duration_us = _seconds(params["duration"], f"Image {image_index} CAMERA_AFTER {object_id} duration")
+            if duration_us <= 0:
+                raise DrawParseError(f"Image {image_index} CAMERA_AFTER {object_id} duration must be positive")
+            duration_mode = "fixed"
+    hold_us = 0
+    if "hold" in params:
+        hold_us = _seconds(params["hold"], f"Image {image_index} CAMERA_AFTER {object_id} hold")
+    framing = params.get("framing", "camera_frame").casefold()
+    if framing not in {"camera_frame", "object_frame", "object_box"}:
+        raise DrawParseError(f"Image {image_index} CAMERA_AFTER {object_id} framing is invalid")
+    easing = params.get("easing", "ease_in_out").casefold()
+    if easing not in {"ease_in_out", "linear"}:
+        raise DrawParseError(f"Image {image_index} CAMERA_AFTER {object_id} easing is invalid")
+    return CameraAfterDirective(object_id, action, target, duration_us, duration_mode, hold_us, framing, easing)
+
+
 def parse_draw_effect(path: str | Path) -> DrawEffectFile:
     source = Path(path)
     try:
@@ -160,6 +205,7 @@ def parse_draw_effect(path: str | Path) -> DrawEffectFile:
         headers: dict[str, str] = {}
         actions: list[DrawAction] = []
         object_effects: list[ObjectEffectOverride] = []
+        camera_after: list[CameraAfterDirective] = []
         lines = [raw.strip() for raw in cue.text.splitlines() if raw.strip()]
         if lines:
             block_header = _BLOCK_HEADER.fullmatch(lines[0])
@@ -182,6 +228,11 @@ def parse_draw_effect(path: str | Path) -> DrawEffectFile:
                 if any(item.target == override.target for item in object_effects):
                     raise DrawParseError(f"Image {image_index}: duplicate OBJECT_EFFECT target {override.target}")
                 object_effects.append(override)
+            elif _CAMERA_AFTER.fullmatch(line):
+                directive = _parse_camera_after(line, image_index)
+                if any(item.object_id == directive.object_id for item in camera_after):
+                    raise DrawParseError(f"Image {image_index}: duplicate CAMERA_AFTER for object {directive.object_id}")
+                camera_after.append(directive)
             else:
                 actions.append(_parse_action(line, image_index))
         unknown_headers = sorted(set(headers) - {"image", "mode", "style", "objects"})
@@ -215,7 +266,9 @@ def parse_draw_effect(path: str | Path) -> DrawEffectFile:
                     raise DrawParseError(f"Image {image_index}: camera actions overlap ({left.type.value}, {right.type.value})")
         if object_effects and mode is not DrawMode.ADVANCED:
             raise DrawParseError(f"Image {image_index}: OBJECT_EFFECT directives require advanced_draw")
-        plans.append(DrawImagePlan(image_index, headers.get("image"), cue.start_us, cue.end_us, mode, style, objects, tuple(actions), tuple(object_effects)))
+        if camera_after and mode is not DrawMode.ADVANCED:
+            raise DrawParseError(f"Image {image_index}: CAMERA_AFTER directives require advanced_draw")
+        plans.append(DrawImagePlan(image_index, headers.get("image"), cue.start_us, cue.end_us, mode, style, objects, tuple(actions), tuple(object_effects), tuple(camera_after)))
     return DrawEffectFile(source, tuple(plans), tuple(warnings))
 
 

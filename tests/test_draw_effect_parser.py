@@ -205,3 +205,113 @@ def test_object_effect_rejects_invalid_duration(tmp_path: Path) -> None:
         """)
     with pytest.raises(DrawParseError, match="duration must be a number of seconds"):
         parse_draw_effect(path)
+
+
+def test_camera_after_parsing_valid(tmp_path: Path) -> None:
+    path = write_effect(
+        tmp_path / "camera_after_valid.srt",
+        """
+        1
+        00:00:00,000 --> 00:00:05,000
+        MODE advanced_draw
+        STYLE v2
+        CAMERA_AFTER object=object_1 action=focus target=object_1 duration=0.55 hold=0.15 framing=camera_frame easing=ease_in_out
+        CAMERA_AFTER object=object_2 action=pan_to target=object_2 duration=auto hold=0.10
+        CAMERA_AFTER object=object_6 action=full_view duration=0.70 hold=0.20 easing=linear
+        DRAW 0s-5s:
+        """,
+    )
+    plan = parse_draw_effect(path).images[0]
+    assert len(plan.camera_after) == 3
+
+    c1 = plan.camera_after[0]
+    assert c1.object_id == "object_1"
+    assert c1.action == "focus"
+    assert c1.target == "object_1"
+    assert c1.duration_us == 550_000
+    assert c1.duration_mode == "fixed"
+    assert c1.hold_us == 150_000
+    assert c1.framing == "camera_frame"
+    assert c1.easing == "ease_in_out"
+
+    c2 = plan.camera_after[1]
+    assert c2.object_id == "object_2"
+    assert c2.action == "pan_to"
+    assert c2.target == "object_2"
+    assert c2.duration_us is None
+    assert c2.duration_mode == "auto"
+    assert c2.hold_us == 100_000
+    assert c2.framing == "camera_frame"
+    assert c2.easing == "ease_in_out"
+
+    c3 = plan.camera_after[2]
+    assert c3.object_id == "object_6"
+    assert c3.action == "full_view"
+    assert c3.target == ""
+    assert c3.duration_us == 700_000
+    assert c3.duration_mode == "fixed"
+    assert c3.hold_us == 200_000
+    assert c3.easing == "linear"
+
+
+@pytest.mark.parametrize(
+    "cue_body, expected_err",
+    [
+        ("CAMERA_AFTER action=focus", "requires object"),
+        ("CAMERA_AFTER object=obj1 action=jump", "invalid action"),
+        ("CAMERA_AFTER object=obj1 action=focus duration=fast", "duration must be a number of seconds"),
+        ("CAMERA_AFTER object=obj1 action=focus duration=-0.5", "duration cannot be negative"),
+        ("CAMERA_AFTER object=obj1 action=focus hold=-0.1", "hold cannot be negative"),
+        ("CAMERA_AFTER object=obj1 action=focus framing=diagonal", "framing is invalid"),
+        ("CAMERA_AFTER object=obj1 action=focus easing=bounce", "easing is invalid"),
+        ("CAMERA_AFTER object=obj1 action=focus foo=bar", "unsupported parameter"),
+    ],
+)
+def test_camera_after_rejects_invalid_parameters(tmp_path: Path, cue_body: str, expected_err: str) -> None:
+    path = write_effect(
+        tmp_path / "invalid_cam.srt",
+        f"""
+        1
+        00:00:00,000 --> 00:00:02,000
+        MODE advanced_draw
+        STYLE v1
+        {cue_body}
+        DRAW 0s-2s:
+        """,
+    )
+    with pytest.raises(DrawParseError, match=expected_err):
+        parse_draw_effect(path)
+
+
+def test_camera_after_requires_advanced_mode(tmp_path: Path) -> None:
+    path = write_effect(
+        tmp_path / "basic_cam.srt",
+        """
+        1
+        00:00:00,000 --> 00:00:02,000
+        MODE basic_draw
+        STYLE v1
+        CAMERA_AFTER object=obj1 action=focus
+        DRAW 0s-2s:
+        """,
+    )
+    with pytest.raises(DrawParseError, match="require advanced_draw"):
+        parse_draw_effect(path)
+
+
+def test_camera_after_rejects_duplicate_object(tmp_path: Path) -> None:
+    path = write_effect(
+        tmp_path / "dup_cam.srt",
+        """
+        1
+        00:00:00,000 --> 00:00:02,000
+        MODE advanced_draw
+        STYLE v1
+        CAMERA_AFTER object=obj1 action=focus
+        CAMERA_AFTER object=obj1 action=pan_to
+        DRAW 0s-2s:
+        """,
+    )
+    with pytest.raises(DrawParseError, match="duplicate CAMERA_AFTER"):
+        parse_draw_effect(path)
+

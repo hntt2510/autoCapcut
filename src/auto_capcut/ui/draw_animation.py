@@ -374,6 +374,17 @@ class DrawObjectEditorDialog(QDialog):
     def _record(self) -> dict:
         return self.records[self.images[self.current_image].name.casefold()]
 
+    @staticmethod
+    def _object_label(item: dict) -> str:
+        cam_str = "Camera ✓" if item.get("camera") is not None else "Camera —"
+        return f"{item['id']}  ({cam_str})"
+
+    def _refresh_object_labels(self) -> None:
+        record = self._record()
+        for idx, item in enumerate(record.get("objects", [])):
+            if idx < self.object_list.count():
+                self.object_list.item(idx).setText(self._object_label(item))
+
     def _image_changed(self, index: int) -> None:
         if not self.images:
             return
@@ -381,7 +392,7 @@ class DrawObjectEditorDialog(QDialog):
         self.canvas.set_image(self.images[index])
         self.object_list.clear()
         record = self._record()
-        self.object_list.addItems([item["id"] for item in record["objects"]])
+        self.object_list.addItems([self._object_label(item) for item in record["objects"]])
         self.current_object = -1
         self._object_changed(-1)
         self._sync_canvas()
@@ -393,6 +404,7 @@ class DrawObjectEditorDialog(QDialog):
             item = record["objects"][index]
             if self.camera_mode and item["camera"] is None:
                 self._ensure_camera_frame(item)
+                self._refresh_object_labels()
             self.name.setText(item["id"]); self.kind.setCurrentText(item["type"])
         else:
             self.name.clear()
@@ -413,6 +425,8 @@ class DrawObjectEditorDialog(QDialog):
         record = self._record()
         if 0 <= index < len(record["objects"]):
             record["objects"][index][key] = rect
+            if key == "camera":
+                self._refresh_object_labels()
 
     def _rename(self) -> None:
         if not (0 <= self.current_object < len(self._record()["objects"])):
@@ -423,7 +437,7 @@ class DrawObjectEditorDialog(QDialog):
         old = self._record()["objects"][self.current_object]["id"]
         self._record()["objects"][self.current_object]["id"] = value
         self._record()["order"] = [value if item == old else item for item in self._record()["order"]]
-        self.object_list.item(self.current_object).setText(value)
+        self.object_list.item(self.current_object).setText(self._object_label(self._record()["objects"][self.current_object]))
 
     def _kind_changed(self, value: str) -> None:
         if 0 <= self.current_object < len(self._record()["objects"]):
@@ -436,7 +450,7 @@ class DrawObjectEditorDialog(QDialog):
         while any(item["id"] == f"{base}_{number}" for item in record["objects"]):
             number += 1
         item = {"id": f"{base}_{number}", "type": "art", "box": NormalizedRect(0.35, 0.35, 0.3, 0.3), "camera": None, "behavior_fields_present": frozenset()}
-        record["objects"].append(item); record["order"].append(item["id"]); self.object_list.addItem(item["id"]); self.object_list.setCurrentRow(len(record["objects"]) - 1)
+        record["objects"].append(item); record["order"].append(item["id"]); self.object_list.addItem(self._object_label(item)); self.object_list.setCurrentRow(len(record["objects"]) - 1)
 
     def _delete(self) -> None:
         if 0 <= self.current_object < len(self._record()["objects"]):
@@ -448,12 +462,13 @@ class DrawObjectEditorDialog(QDialog):
             return
         current = record["objects"][self.current_object]["id"]
         position = record["order"].index(current)
-        target = max(0, min(len(record["order"]) - 1, position + delta))
-        record["order"][position], record["order"][target] = record["order"][target], record["order"][position]
-        by_id = {item["id"]: item for item in record["objects"]}
-        record["objects"][:] = [by_id[item_id] for item_id in record["order"]]
-        self._image_changed(self.current_image)
-        self.object_list.setCurrentRow(target)
+        target = position + delta
+        if 0 <= target < len(record["order"]):
+            record["order"][position], record["order"][target] = record["order"][target], record["order"][position]
+            by_id = {item["id"]: item for item in record["objects"]}
+            record["objects"][:] = [by_id[item_id] for item_id in record["order"]]
+            self._image_changed(self.current_image)
+            self.object_list.setCurrentRow(target)
 
     def _ensure_camera_frame(self, item: dict) -> None:
         box = item["box"]

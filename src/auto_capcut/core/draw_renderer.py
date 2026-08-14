@@ -12,12 +12,17 @@ import tempfile
 from collections import deque
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 import numpy as np
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageOps
 
 from auto_capcut.core.draw_models import (
+    CameraActionType,
+    CameraAfterDirective,
+    CameraEasing,
+    CameraFramingMode,
+    CameraState,
     DrawActionType,
     DrawImagePlan,
     DrawMode,
@@ -30,15 +35,16 @@ from auto_capcut.core.draw_models import (
     NormalizedRect,
     ObjectEffectOverride,
     SceneImage,
+    SceneObject,
     TextMode,
 )
-from auto_capcut.core.errors import DrawRenderError, SceneValidationError
+from auto_capcut.core.errors import DrawParseError, DrawRenderError, SceneValidationError
 from auto_capcut.core.draw_scene import load_scene, sha256_file, validate_scene_document
 
 LOGGER = logging.getLogger(__name__)
 
 ALGORITHM_VERSION = "draw-v2-object-schedule"
-OBJECT_EFFECT_PREPROCESS_VERSION = "object-entrance-v2-transparent"
+OBJECT_EFFECT_PREPROCESS_VERSION = "object-entrance-v3-transparent"
 COLOR_REVEAL_MAX_US = 600_000
 
 
@@ -121,7 +127,7 @@ class ScheduledGroup:
     object_type: str
     strokes: tuple[Stroke, ...]
     duration_us: int
-    path_length: float
+    path_length: float = 0.0
     effect: str = DrawObjectEffect.DRAW.value
     direction: str = DrawObjectDirection.AUTO.value
     object_box: NormalizedRect | None = None
@@ -146,13 +152,19 @@ class ScheduledGroup:
 
 @dataclass(frozen=True)
 class SchedulePhase:
-    kind: str
+    kind: str  # travel | object | pause | hold | camera | camera_hold
     start_us: int
     end_us: int
     group_index: int | None = None
     object_id: str = ""
     from_point: tuple[float, float] | None = None
     to_point: tuple[float, float] | None = None
+    camera_start: CameraState | None = None
+    camera_end: CameraState | None = None
+    camera_easing: str = "ease_in_out"
+    camera_action: str = ""
+    camera_target: str = ""
+    framing_source: str = ""
 
     @property
     def duration_us(self) -> int:
@@ -632,56 +644,202 @@ def _prepare_object_layers(artifact: ProcessedImage, scene: SceneImage, configs:
     return layers, resolved, tuple(fallbacks)
 
 
-def _rect_viewport(rect: NormalizedRect, aspect: float, padding: float = 0.10) -> tuple[float, float, float, float]:
-    x = max(0.0, rect.x - rect.w * padding)
-    y = max(0.0, rect.y - rect.h * padding)
-    width = min(1.0 - x, rect.w * (1 + padding * 2))
-    height = min(1.0 - y, rect.h * (1 + padding * 2))
-    if width / height > aspect:
-        height = min(1.0, width / aspect)
-    else:
-        width = min(1.0, height * aspect)
-    x = min(max(0.0, rect.center_x - width / 2), 1.0 - width)
-    y = min(max(0.0, rect.center_y - height / 2), 1.0 - height)
-    return x, y, width, height
+FULL_VIEW_STATE = CameraState((0.0, 0.0, 1.0, 1.0))
 
 
-def _interpolate(a: tuple[float, float, float, float], b: tuple[float, float, float, float], value: float, easing: str) -> tuple[float, float, float, float]:
+def _resolve_camera_target(
+    action: str,
+    target_obj: SceneObject | None,
+    framing: str,
+    current_state: CameraState,
+    canvas_aspect: float,
+    source_size: tuple[int, int],
+    max_zoom: float = 2.4,
+    padding: float = 0.12,
+) -> tuple[CameraState, str, bool]:
+    """Resolve target CameraState for focus, pan_to, pull_to, full_view."""
+    action = action.casefold()
+    if action == "full_view" or target_obj is None:
+        return FULL_VIEW_STATE, "full_view", False
+
+    source_w, source_h = source_size
+    norm_aspect = (canvas_aspect) / max(1e-6, source_w / source_h)
+
+    if action == "focus":
+        # 1. Saved Camera Frame (exact viewport, no approximation)
+        if framing == "camera_frame" and target_obj.camera_frame is not None:
+            cf = target_obj.camera_frame
+            w = max(0.01, min(1.0, cf.w))
+            h = max(0.01, min(1.0, cf.h))
+            x = min(max(0.0, cf.x), 1.0 - w)
+            y = min(max(0.0, cf.y), 1.0 - h)
+            clamped = x != cf.x or y != cf.y or w != cf.w or h != cf.h
+            return CameraState((x, y, w, h)), "saved_camera_frame", clamped
+
+        # 2. Derived object frame
+        box = target_obj.box
+        pw = min(1.0, box.w * (1.0 + 2.0 * padding))
+        ph = min(1.0, box.h * (1.0 + 2.0 * padding))
+        if pw / max(1e-6, ph) > norm_aspect:
+            tw = pw
+            th = pw / norm_aspect
+        else:
+            th = ph
+            tw = ph * norm_aspect
+
+        # Max safe zoom constraint:
+        min_w = 1.0 / max_zoom
+        min_h = min_w / norm_aspect
+        if tw < min_w or th < min_h:
+            scale_up = max(min_w / max(1e-6, tw), min_h / max(1e-6, th))
+            tw = tw * scale_up
+            th = th * scale_up
+        if tw > 1.0:
+            tw = 1.0
+            th = min(1.0, tw / norm_aspect)
+        if th > 1.0:
+            th = 1.0
+            tw = min(1.0, th * norm_aspect)
+
+        tx = min(max(0.0, box.center_x - tw / 2.0), 1.0 - tw)
+        ty = min(max(0.0, box.center_y - th / 2.0), 1.0 - th)
+        clamped = tx == 0.0 or ty == 0.0 or tx + tw >= 1.0 or ty + th >= 1.0
+        return CameraState((tx, ty, tw, th)), "derived_object_frame", clamped
+
+    elif action == "pan_to":
+        # Target center
+        if target_obj.camera_frame is not None:
+            cx, cy = target_obj.camera_frame.center_x, target_obj.camera_frame.center_y
+            src_label = "saved_camera_frame_center"
+        else:
+            cx, cy = target_obj.box.center_x, target_obj.box.center_y
+            src_label = "derived_object_center"
+
+        # Preserve current viewport zoom / size as much as possible
+        cur_w, cur_h = current_state.w, current_state.h
+        box = target_obj.box
+        # Check if target object fits inside current zoom
+        if box.w > cur_w or box.h > cur_h:
+            needed_w = max(cur_w, min(1.0, box.w * (1.0 + 2.0 * padding)))
+            needed_h = max(cur_h, min(1.0, box.h * (1.0 + 2.0 * padding)))
+            if needed_w / max(1e-6, needed_h) > norm_aspect:
+                tw = min(1.0, needed_w)
+                th = min(1.0, tw / norm_aspect)
+            else:
+                th = min(1.0, needed_h)
+                tw = min(1.0, th * norm_aspect)
+        else:
+            tw = cur_w
+            th = cur_h
+
+        tx = min(max(0.0, cx - tw / 2.0), 1.0 - tw)
+        ty = min(max(0.0, cy - th / 2.0), 1.0 - th)
+        clamped = tx == 0.0 or ty == 0.0 or tx + tw >= 1.0 or ty + th >= 1.0
+        return CameraState((tx, ty, tw, th)), src_label, clamped
+
+    elif action == "pull_to":
+        # Pull to ends wider than starting view
+        focus_state, src_label, clamped = _resolve_camera_target("focus", target_obj, framing, current_state, canvas_aspect, source_size, max_zoom, padding)
+        if focus_state.w < current_state.w:
+            # Would require zooming IN, fallback to focus semantics
+            return focus_state, f"{src_label} (focus_fallback)", clamped
+        return focus_state, src_label, clamped
+
+    return FULL_VIEW_STATE, "full_view", False
+
+
+def _interpolate_camera_state(start_state: CameraState, end_state: CameraState, progress: float, easing: str = "ease_in_out") -> CameraState:
+    if progress <= 0.0:
+        return start_state
+    if progress >= 1.0:
+        return end_state
+    easing = easing.casefold()
     if easing == "ease_in_out":
-        value = value * value * (3 - 2 * value)
-    return tuple(left + (right - left) * value for left, right in zip(a, b))
+        s = progress * progress * (3.0 - 2.0 * progress)
+    else:
+        s = progress
+
+    # Smooth center interpolation
+    cx = (1.0 - s) * start_state.center_x + s * end_state.center_x
+    cy = (1.0 - s) * start_state.center_y + s * end_state.center_y
+
+    # Log-scale / geometric zoom interpolation
+    ln_w = (1.0 - s) * math.log(max(1e-6, start_state.w)) + s * math.log(max(1e-6, end_state.w))
+    ln_h = (1.0 - s) * math.log(max(1e-6, start_state.h)) + s * math.log(max(1e-6, end_state.h))
+    w = math.exp(ln_w)
+    h = math.exp(ln_h)
+
+    # Clamped bounds
+    x = min(max(0.0, cx - w / 2.0), 1.0 - w)
+    y = min(max(0.0, cy - h / 2.0), 1.0 - h)
+    return CameraState((x, y, w, h))
+
+
+def _auto_camera_duration_us(start_state: CameraState, end_state: CameraState, action: str) -> int:
+    action = action.casefold()
+    if action == "full_view":
+        return 650_000
+    dist = math.hypot(end_state.center_x - start_state.center_x, end_state.center_y - start_state.center_y)
+    scale_delta = abs(math.log(max(1e-6, end_state.scale)) - math.log(max(1e-6, start_state.scale)))
+    dur_s = 0.45 + dist * 0.35 + scale_delta * 0.20
+    return round(max(0.40, min(0.75, dur_s)) * 1_000_000)
+
+
+def _camera_state_at(
+    schedule: DrawSchedule,
+    plan: DrawImagePlan,
+    scene: SceneImage | None,
+    time_us: int,
+    canvas_aspect: float,
+    source_size: tuple[int, int],
+) -> CameraState:
+    camera_phases = [p for p in schedule.phases if p.kind in {"camera", "camera_hold"}]
+    current_state = FULL_VIEW_STATE
+    if camera_phases:
+        for phase in schedule.phases:
+            if phase.kind == "camera":
+                if phase.camera_start is not None and phase.camera_end is not None:
+                    if phase.start_us <= time_us < phase.end_us:
+                        fraction = (time_us - phase.start_us) / max(1, phase.duration_us)
+                        return _interpolate_camera_state(phase.camera_start, phase.camera_end, fraction, phase.camera_easing)
+                    elif time_us >= phase.end_us:
+                        current_state = phase.camera_end
+            elif phase.kind == "camera_hold":
+                if phase.camera_end is not None:
+                    if phase.start_us <= time_us < phase.end_us:
+                        return phase.camera_end
+                    elif time_us >= phase.end_us:
+                        current_state = phase.camera_end
+            elif phase.camera_end is not None and time_us >= phase.end_us:
+                current_state = phase.camera_end
+
+    # Also check timed actions (e.g. FULL_VIEW 10.80s-11.45s, FOCUS, etc.)
+    for action in plan.actions:
+        if action.type is DrawActionType.DRAW or action.type is DrawActionType.SETTLE:
+            continue
+        if time_us < action.start_us:
+            continue
+        if action.type is DrawActionType.FULL_VIEW:
+            target_state = FULL_VIEW_STATE
+        else:
+            obj = scene.object_map.get(action.params.get("target", "")) if scene else None
+            if obj is None:
+                continue
+            framing = action.params.get("framing", "camera_frame").casefold()
+            target_state, _, _ = _resolve_camera_target(action.type.value.lower(), obj, framing, current_state, canvas_aspect, source_size)
+        if time_us < action.end_us:
+            fraction = (time_us - action.start_us) / max(1, action.duration_us)
+            easing = action.params.get("easing", "ease_in_out").casefold()
+            return _interpolate_camera_state(current_state, target_state, fraction, easing)
+        current_state = target_state
+
+    return current_state
 
 
 def _viewport_at(plan: DrawImagePlan, scene: SceneImage | None, time_us: int, aspect: float) -> tuple[float, float, float, float]:
-    full = (0.0, 0.0, 1.0, 1.0)
-    current = full
-    object_map = scene.object_map if scene else {}
-    for action in plan.actions:
-        if action.type is DrawActionType.DRAW or time_us < action.start_us:
-            continue
-        if action.type is DrawActionType.SETTLE:
-            continue
-        if action.type is DrawActionType.FULL_VIEW:
-            target = full
-        else:
-            obj = object_map.get(action.params.get("target", ""))
-            if obj is None:
-                continue
-            rect = obj.camera_frame if action.params.get("framing", "camera_frame").casefold() == "camera_frame" else obj.box
-            if rect is None:
-                continue
-            target = _rect_viewport(rect, aspect)
-            if action.type is DrawActionType.PAN_TO:
-                target = (target[0], target[1], current[2], current[3])
-        if time_us < action.end_us:
-            fraction = (time_us - action.start_us) / action.duration_us
-            if action.type is DrawActionType.PULL_TO:
-                if fraction < 0.4:
-                    return _interpolate(current, full, fraction / 0.4, action.params.get("easing", "ease_in_out"))
-                return _interpolate(full, target, (fraction - 0.4) / 0.6, action.params.get("easing", "ease_in_out"))
-            return _interpolate(current, target, fraction, action.params.get("easing", "ease_in_out"))
-        current = target
-    return current
+    source_size = scene.source_size if scene else (1920, 1080)
+    schedule = DrawSchedule((), (), plan.start_us, plan.end_us, plan.end_us, plan.end_us)
+    return _camera_state_at(schedule, plan, scene, time_us, aspect, source_size).viewport
 
 
 def _crop(image: Image.Image, viewport: tuple[float, float, float, float], size: tuple[int, int]) -> Image.Image:
@@ -937,10 +1095,28 @@ def _build_advanced_schedule(strokes: tuple[Stroke, ...], plan: DrawImagePlan, s
     order = _resolved_object_order(plan, scene)
     assigned, unmatched = _assign_strokes_to_objects(strokes, scene, order)
     pixel_size = source_size or scene.source_size
+    canvas_aspect = pixel_size[0] / max(1, pixel_size[1])
     direction = draw.params.get("direction", "auto")
+
+    # Validate CAMERA_AFTER directives
+    for cam_dir in plan.camera_after:
+        if cam_dir.object_id not in scene.object_map:
+            raise DrawParseError(
+                f"Unknown CAMERA_AFTER object: {cam_dir.object_id}\n"
+                f"Available objects: {', '.join(sorted(scene.object_map))}"
+            )
+        if cam_dir.target and cam_dir.target not in scene.object_map:
+            raise DrawParseError(
+                f"Unknown CAMERA_AFTER target: {cam_dir.target}\n"
+                f"Available objects: {', '.join(sorted(scene.object_map))}"
+            )
+
+    camera_after_by_obj = {item.object_id: item for item in plan.camera_after}
+
     if effect_configs is None:
         effect_configs, resolved_fallbacks = _resolve_object_effects(plan, scene)
         fallbacks = tuple(fallbacks) + resolved_fallbacks
+
     groups: list[ScheduledGroup] = []
     for object_id in order:
         obj = scene.object_map.get(object_id)
@@ -951,56 +1127,160 @@ def _build_advanced_schedule(strokes: tuple[Stroke, ...], plan: DrawImagePlan, s
         ordered = _sort_group_strokes(assigned.get(object_id, ()), direction)
         pixel_length = sum(stroke.pixel_length(pixel_size) for stroke in ordered)
         groups.append(ScheduledGroup(object_id, obj.type, ordered, 0, pixel_length, config.effective_effect, local_direction, obj.box, config.pause_after_us, (layers or {}).get(object_id), config.requested_effect, config.requested_direction, config.warning))
+
     policy = draw.params.get("unmatched", "last").casefold()
     unmatched_group = ScheduledGroup("__unmatched__", "unmatched", _sort_group_strokes(unmatched, direction), 0, sum(stroke.pixel_length(pixel_size) for stroke in unmatched))
     if unmatched and policy == "first":
         groups.insert(0, unmatched_group)
     elif unmatched and policy == "last":
         groups.append(unmatched_group)
+
     active = [group for group in groups if group.strokes or group.effect != DrawObjectEffect.DRAW.value]
     budget = max(0, color_start - draw.start_us)
     global_pause = max(0, round(float(draw.params.get("pause_each", "0")) * 1_000_000))
+
     desired = [_auto_effect_duration(effect_configs.get(group.object_id, ObjectEffectConfig(group.object_id, group.effect, group.effect, group.direction, group.direction, None, None)), group) if group.object_id != "__unmatched__" else 0 for group in active]
     auto_draw = [index for index, group in enumerate(active) if group.effect == DrawObjectEffect.DRAW.value and effect_configs.get(group.object_id, ObjectEffectConfig("", "draw", "draw", "auto", "auto", None, None)).duration_us is None]
+
     pauses = [effect_configs.get(left.object_id, ObjectEffectConfig("", "draw", "draw", "auto", "auto", None, None)).pause_after_us if effect_configs.get(left.object_id) and effect_configs[left.object_id].pause_after_us is not None else global_pause for left in active[:-1]]
     transitions = [_transition_us(left, right) if left.effect == DrawObjectEffect.DRAW.value and right.effect == DrawObjectEffect.DRAW.value else 0 for left, right in zip(active, active[1:])]
-    fixed_total = sum(desired) + sum(pauses) + sum(transitions)
+
+    # Precalculate camera targets and durations
+    cam_targets: dict[str, tuple[CameraState, str, bool]] = {}
+    desired_cam_durations: dict[str, int] = {}
+    desired_cam_holds: dict[str, int] = {}
+    cam_sim = FULL_VIEW_STATE
+    for group in active:
+        if group.object_id in camera_after_by_obj:
+            cam_dir = camera_after_by_obj[group.object_id]
+            target_obj = scene.object_map.get(cam_dir.target) if cam_dir.target else scene.object_map.get(cam_dir.object_id)
+            tgt_state, frame_src, is_clamped = _resolve_camera_target(cam_dir.action, target_obj, cam_dir.framing, cam_sim, canvas_aspect, pixel_size)
+            cam_targets[group.object_id] = (tgt_state, frame_src, is_clamped)
+            if cam_dir.duration_mode == "fixed" and cam_dir.duration_us is not None:
+                cam_dur = cam_dir.duration_us
+            else:
+                cam_dur = _auto_camera_duration_us(cam_sim, tgt_state, cam_dir.action)
+            desired_cam_durations[group.object_id] = cam_dur
+            desired_cam_holds[group.object_id] = cam_dir.hold_us
+            cam_sim = tgt_state
+
+    draw_count = sum(1 for group in active if group.effect == DrawObjectEffect.DRAW.value)
+    default_reveal_us = 250_000
+    if budget < default_reveal_us * draw_count:
+        local_reveal_us = max(0, budget // (draw_count * 2 or 1))
+    else:
+        local_reveal_us = default_reveal_us
+    local_finalize_total = local_reveal_us * draw_count
+    total_cam_durations = sum(desired_cam_durations.values())
+    total_cam_holds = sum(desired_cam_holds.values())
+
+    fixed_total = sum(desired) + sum(pauses) + sum(transitions) + local_finalize_total + total_cam_durations + total_cam_holds
     warnings = list(fallbacks)
+
     if fixed_total > budget and fixed_total:
+        srt_fixed_effects = [
+            item.duration_us for item in plan.object_effects
+            if item.duration_mode == "fixed" and item.duration_us is not None
+        ]
+        srt_fixed_cameras = [
+            item.duration_us for item in plan.camera_after
+            if item.duration_mode == "fixed" and item.duration_us is not None
+        ]
+        srt_fixed_holds = [
+            item.hold_us for item in plan.camera_after
+            if item.hold_us > 0
+        ]
+        strictly_fixed_srt = sum(srt_fixed_effects) + sum(srt_fixed_cameras) + sum(srt_fixed_holds)
+        if strictly_fixed_srt > budget and budget > 0:
+            available_s = budget / 1_000_000
+            required_s = strictly_fixed_srt / 1_000_000
+            over_s = (strictly_fixed_srt - budget) / 1_000_000
+            raise DrawParseError(
+                f"Advanced choreography exceeds DRAW interval.\n"
+                f"Available: {available_s:.2f} s\n"
+                f"Required minimum: {required_s:.2f} s\n"
+                f"Over budget: {over_s:.2f} s"
+            )
+
         scale = budget / fixed_total
-        scaled_values = _allocate_weighted(budget, desired + pauses + transitions)
-        desired = scaled_values[:len(desired)]
-        pauses = scaled_values[len(desired):len(desired) + len(pauses)]
-        transitions = scaled_values[len(desired) + len(pauses):]
+        for k in desired_cam_holds:
+            desired_cam_holds[k] = round(desired_cam_holds[k] * scale)
+        for k in desired_cam_durations:
+            if camera_after_by_obj[k].duration_mode == "auto":
+                desired_cam_durations[k] = max(0, round(desired_cam_durations[k] * scale))
+        avail_for_effects = max(0, budget - local_finalize_total - sum(desired_cam_durations.values()) - sum(desired_cam_holds.values()) - sum(pauses) - sum(transitions))
+        desired = _allocate_weighted(avail_for_effects, desired)
         warnings.append(ObjectEffectFallback("__schedule__", "", "", "", f"requested sequence duration {fixed_total / 1_000_000:.3f}s exceeded sketch budget; scaled by {scale:.3f}"))
-    used = sum(desired) + sum(pauses) + sum(transitions)
+
+    used = sum(desired) + sum(pauses) + sum(transitions) + local_finalize_total + sum(desired_cam_durations.values()) + sum(desired_cam_holds.values())
     remaining = max(0, budget - used)
     if auto_draw:
         extras = _allocate_weighted(remaining, [active[index].path_length or len(active[index].strokes) or 1 for index in auto_draw])
         for index, extra in zip(auto_draw, extras):
             desired[index] += extra
         remaining = 0
+
     durations_by_group = {id(group): duration for group, duration in zip(active, desired)}
     groups = [replace(group, duration_us=durations_by_group.get(id(group), 0)) for group in groups]
     active = [group for group in groups if group.strokes or group.effect != DrawObjectEffect.DRAW.value]
+
     phases: list[SchedulePhase] = []
     cursor = draw.start_us
+    cam_state = FULL_VIEW_STATE
+    last_point = None
+
     for index, group in enumerate(active):
-        phases.append(SchedulePhase("object", cursor, cursor + group.duration_us, index, group.object_id))
-        cursor += group.duration_us
+        if index > 0 and transitions[index - 1] > 0:
+            travel = transitions[index - 1]
+            prev_group = active[index - 1]
+            phases.append(SchedulePhase("travel", cursor, cursor + travel, index, group.object_id, prev_group.last_point, group.first_point, camera_start=cam_state, camera_end=cam_state))
+            cursor += travel
+
+        obj_end = cursor + group.duration_us
+        phases.append(SchedulePhase("object", cursor, obj_end, index, group.object_id, camera_start=cam_state, camera_end=cam_state))
+        cursor = obj_end
+        last_point = group.last_point
+
+        if group.effect == DrawObjectEffect.DRAW.value and local_reveal_us > 0:
+            phases.append(SchedulePhase("finalize", cursor, cursor + local_reveal_us, index, group.object_id, camera_start=cam_state, camera_end=cam_state))
+            cursor += local_reveal_us
+
+        if group.object_id in camera_after_by_obj:
+            cam_dir = camera_after_by_obj[group.object_id]
+            tgt_state, frame_src, is_clamped = cam_targets[group.object_id]
+            cam_dur = desired_cam_durations[group.object_id]
+            if cam_dur > 0:
+                phases.append(SchedulePhase("camera", cursor, cursor + cam_dur, index, group.object_id, camera_start=cam_state, camera_end=tgt_state, camera_easing=cam_dir.easing, camera_action=cam_dir.action, camera_target=cam_dir.target or group.object_id, framing_source=frame_src))
+                cursor += cam_dur
+            cam_state = tgt_state
+
+            cam_hold = desired_cam_holds.get(group.object_id, 0)
+            if cam_hold > 0:
+                phases.append(SchedulePhase("camera_hold", cursor, cursor + cam_hold, index, group.object_id, camera_start=cam_state, camera_end=cam_state, camera_action=cam_dir.action, camera_target=cam_dir.target or group.object_id, framing_source=frame_src))
+                cursor += cam_hold
+
         if index < len(active) - 1:
-            pause, travel = pauses[index], transitions[index]
-            if pause:
-                phases.append(SchedulePhase("pause", cursor, cursor + pause, index, group.object_id, group.last_point, group.last_point)); cursor += pause
-            next_group = active[index + 1]
-            if travel:
-                phases.append(SchedulePhase("travel", cursor, cursor + travel, index + 1, next_group.object_id, group.last_point, next_group.first_point)); cursor += travel
+            pause = pauses[index]
+            if pause > 0:
+                phases.append(SchedulePhase("pause", cursor, cursor + pause, index, group.object_id, group.last_point, group.last_point, camera_start=cam_state, camera_end=cam_state))
+                cursor += pause
+
     if cursor < color_start:
         if active:
-            phases.append(SchedulePhase("hold", cursor, color_start, len(active) - 1, active[-1].object_id))
+            phases.append(SchedulePhase("hold", cursor, color_start, len(active) - 1, active[-1].object_id, camera_start=cam_state, camera_end=cam_state))
         else:
-            phases.append(SchedulePhase("hold", cursor, color_start, None, ""))
+            phases.append(SchedulePhase("hold", cursor, color_start, None, "", camera_start=cam_state, camera_end=cam_state))
         cursor = color_start
+
+    # Final reconciliation validation:
+    if final_mode is FinalRevealMode.LINE_THEN_COLOR and cam_targets:
+        has_full_view_return = (
+            cam_state == FULL_VIEW_STATE
+            or any(a.type is DrawActionType.FULL_VIEW for a in plan.actions)
+        )
+        if not has_full_view_return:
+            raise DrawParseError("Final reconciliation requires FULL_VIEW camera state. Add CAMERA_AFTER ... action=full_view or FULL_VIEW before final settle.")
+
     return DrawSchedule(tuple(groups), tuple(phases), draw.start_us, color_start, color_start, draw.end_us, tuple(order), len(unmatched), policy, tuple(warnings))
 
 
@@ -1232,18 +1512,27 @@ class DrawRenderer:
         debug = cache_root / "debug"
         debug.mkdir(parents=True, exist_ok=True)
         lines = [
-            f"Image {plan.image_index:03d}",
+            f"IMAGE {plan.image_index:03d} CAMERA CHOREOGRAPHY",
             f"Mode: {plan.mode.value}",
             "",
+            "Initial camera:",
+            "  FULL_VIEW",
+            "",
             "Resolved object order:",
-            *[f"{index} {object_id}" for index, object_id in enumerate(schedule.resolved_order, 1)],
+            *[f"  {index} {object_id}" for index, object_id in enumerate(schedule.resolved_order, 1)],
             "",
             "Groups & Per-Object Lifecycle:",
         ]
         group_phases: dict[int, SchedulePhase] = {}
+        camera_phases_by_obj: dict[str, SchedulePhase] = {}
+        camera_hold_phases_by_obj: dict[str, SchedulePhase] = {}
         for phase in schedule.phases:
             if phase.kind == "object" and phase.group_index is not None:
                 group_phases[phase.group_index] = phase
+            elif phase.kind == "camera":
+                camera_phases_by_obj[phase.object_id] = phase
+            elif phase.kind == "camera_hold":
+                camera_hold_phases_by_obj[phase.object_id] = phase
 
         for idx, group in enumerate(schedule.groups):
             phase = group_phases.get(idx)
@@ -1251,37 +1540,51 @@ class DrawRenderer:
             t_end = phase.end_us if phase else 0
             duration_s = (t_end - t_start) / 1_000_000
 
+            lines.append(f"Object: {group.object_id}")
+            lines.append(f"OBJECT {group.object_id}")
             if group.effect == DrawObjectEffect.DRAW.value:
                 local_reveal_us = 250_000
                 done_us = t_end + local_reveal_us
-                lines.append(f"Object: {group.object_id}")
                 lines.append(f"  Effect: draw")
-                lines.append(f"  Draw phase: {t_start} - {t_end} us ({len(group.strokes)} strokes, {group.path_length:.2f} px path, {duration_s:.3f}s)")
-                lines.append(f"  Local color reveal: {t_end} - {done_us} us (0.250s)")
-                lines.append(f"  DONE at: {done_us} us")
+                lines.append(f"  Draw phase: {t_start / 1_000_000:.2f} -> {t_end / 1_000_000:.2f} s ({len(group.strokes)} strokes, {group.path_length:.2f} px path, {duration_s:.3f}s)")
+                lines.append(f"  Local color reveal: {t_end / 1_000_000:.2f} -> {done_us / 1_000_000:.2f} s (0.250s)")
+                lines.append(f"  DONE at: {done_us / 1_000_000:.2f} s")
             elif group.effect == DrawObjectEffect.PUSH_IN.value:
                 asset_name = "push_hand_top.png" if group.direction == DrawObjectDirection.TOP.value else "push_hand_side.png"
                 asset_file = self.push_top_asset if group.direction == DrawObjectDirection.TOP.value else self.push_side_asset
                 loaded = "YES" if asset_file and asset_file.is_file() else "NO"
                 anchor = self.push_top_anchor if group.direction == DrawObjectDirection.TOP.value else self.push_side_anchor
-                lines.append(f"Object: {group.object_id}")
                 lines.append(f"  Resolved effect: push_in")
                 lines.append(f"  Direction: {group.direction}")
                 lines.append(f"  Fallback: NO")
                 lines.append(f"  Push hand asset: {asset_name}")
                 lines.append(f"  Asset loaded: {loaded}")
                 lines.append(f"  Hand anchor: {anchor}")
-                lines.append(f"  Hand visible frame range: {t_start} - {t_end} us (approach=15% joint_push=70% retract=15%)")
-                lines.append(f"  Object frame range: {t_start} - {t_end} us ({duration_s:.3f}s)")
+                lines.append(f"  Hand visible frame range: {t_start / 1_000_000:.2f} -> {t_end / 1_000_000:.2f} s (approach=15% joint_push=70% retract=15%)")
+                lines.append(f"  Object frame range: {t_start / 1_000_000:.2f} -> {t_end / 1_000_000:.2f} s ({duration_s:.3f}s)")
                 lines.append(f"  Z-order: hand above object")
-                lines.append(f"  DONE at: {t_end} us")
+                lines.append(f"  DONE at: {t_end / 1_000_000:.2f} s")
             else:
-                lines.append(f"Object: {group.object_id}")
                 lines.append(f"  Resolved effect: {group.effect}")
                 lines.append(f"  Direction: {group.direction}")
-                lines.append(f"  Object frame range: {t_start} - {t_end} us ({duration_s:.3f}s)")
+                lines.append(f"  Object frame range: {t_start / 1_000_000:.2f} -> {t_end / 1_000_000:.2f} s ({duration_s:.3f}s)")
                 lines.append(f"  Hand: None")
-                lines.append(f"  DONE at: {t_end} us")
+                lines.append(f"  DONE at: {t_end / 1_000_000:.2f} s")
+
+            if group.object_id in camera_phases_by_obj:
+                cam = camera_phases_by_obj[group.object_id]
+                hold = camera_hold_phases_by_obj.get(group.object_id)
+                hold_s = (hold.duration_us / 1_000_000) if hold else 0.0
+                start_st = cam.camera_start or FULL_VIEW_STATE
+                end_st = cam.camera_end or FULL_VIEW_STATE
+                lines.append(f"  CAMERA_AFTER:")
+                lines.append(f"    Action: {cam.camera_action}")
+                lines.append(f"    Target: {cam.camera_target}")
+                lines.append(f"    Frame source: {cam.framing_source}")
+                lines.append(f"    Camera timing: {cam.start_us / 1_000_000:.2f} -> {cam.end_us / 1_000_000:.2f} s ({cam.duration_us / 1_000_000:.3f}s)")
+                lines.append(f"    Hold timing: {hold_s:.2f} s")
+                lines.append(f"    Start state: center=({start_st.center_x:.3f}, {start_st.center_y:.3f}) scale={start_st.scale:.2f} viewport=({start_st.x:.3f}, {start_st.y:.3f}, {start_st.w:.3f}, {start_st.h:.3f})")
+                lines.append(f"    End state: center=({end_st.center_x:.3f}, {end_st.center_y:.3f}) scale={end_st.scale:.2f} viewport=({end_st.x:.3f}, {end_st.y:.3f}, {end_st.w:.3f}, {end_st.h:.3f})")
 
         if schedule.fallbacks:
             lines.extend(("", "Fallbacks:"))
@@ -1293,10 +1596,23 @@ class DrawRenderer:
                 lines.append(f"  Direction: {fallback.requested_direction} -> {fallback.effective_direction}")
                 lines.append(f"  REASON: {fallback.reason}")
 
-        lines.extend(("", f"Unmatched strokes: {schedule.unmatched_count}", f"Policy: {schedule.unmatched_policy}", f"Sketch: {schedule.sketch_start_us}-{schedule.sketch_end_us}us", f"Color: {schedule.color_start_us}-{schedule.color_end_us}us", "", "Phases:"))
+        lines.extend((
+            "",
+            f"Budget summary:",
+            f"  Available DRAW interval: {plan.draw_action.duration_us / 1_000_000:.3f} s",
+            f"  Total sketch/action duration: {schedule.sketch_end_us / 1_000_000:.3f} s",
+            f"  Reconciliation: {schedule.color_start_us / 1_000_000:.3f} -> {schedule.color_end_us / 1_000_000:.3f} s",
+            f"  Unmatched strokes: {schedule.unmatched_count} (policy: {schedule.unmatched_policy})",
+            "",
+            "Final camera state:",
+            "  FULL_VIEW",
+            "",
+            "Phases:",
+        ))
         for phase in schedule.phases:
             endpoints = f" from={phase.from_point} to={phase.to_point}" if phase.from_point or phase.to_point else ""
-            lines.append(f"{phase.kind}: {phase.start_us}-{phase.end_us}us ({phase.duration_us / 1_000_000:.3f}s) object={phase.object_id}{endpoints}")
+            cam_info = f" cam={phase.camera_action}:{phase.camera_target}" if phase.camera_action else ""
+            lines.append(f"  {phase.kind}: {phase.start_us / 1_000_000:.3f} - {phase.end_us / 1_000_000:.3f}s ({phase.duration_us / 1_000_000:.3f}s) object={phase.object_id}{endpoints}{cam_info}")
         destination = debug / f"{plan.image_index:03d}_draw_schedule.txt"
         temporary = destination.with_suffix(".partial")
         temporary.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -1545,7 +1861,9 @@ class DrawRenderer:
                     elif color_fraction > 0.0:
                         frame = Image.blend(frame, original, color_fraction)
 
-        viewport = _viewport_at(plan, scene, time_us, size[0] / size[1])
+        canvas_aspect = size[0] / max(1, size[1])
+        camera_state = _camera_state_at(schedule, plan, scene, time_us, canvas_aspect, original.size)
+        viewport = camera_state.viewport
         result = _crop(frame, viewport, size)
 
         # Hand overlay (composited above all frame elements on the cropped viewport)
