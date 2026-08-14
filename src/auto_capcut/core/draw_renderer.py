@@ -775,6 +775,21 @@ def _interpolate_camera_state(start_state: CameraState, end_state: CameraState, 
     return CameraState((x, y, w, h))
 
 
+def _box_intersection_ratio(box: NormalizedRect | None, viewport: tuple[float, float, float, float]) -> float:
+    if box is None:
+        return 1.0
+    vx, vy, vw, vh = viewport
+    ix1 = max(box.x, vx)
+    iy1 = max(box.y, vy)
+    ix2 = min(box.x + box.w, vx + vw)
+    iy2 = min(box.y + box.h, vy + vh)
+    inter_w = max(0.0, ix2 - ix1)
+    inter_h = max(0.0, iy2 - iy1)
+    inter_area = inter_w * inter_h
+    box_area = max(1e-6, box.w * box.h)
+    return inter_area / box_area
+
+
 def _auto_camera_duration_us(start_state: CameraState, end_state: CameraState, action: str) -> int:
     action = action.casefold()
     if action == "full_view":
@@ -793,11 +808,11 @@ def _camera_state_at(
     canvas_aspect: float,
     source_size: tuple[int, int],
 ) -> CameraState:
-    camera_phases = [p for p in schedule.phases if p.kind in {"camera", "camera_hold"}]
+    camera_phases = [p for p in schedule.phases if p.kind in {"camera", "camera_hold", "camera_staging"}]
     current_state = FULL_VIEW_STATE
     if camera_phases:
         for phase in schedule.phases:
-            if phase.kind == "camera":
+            if phase.kind in {"camera", "camera_staging"}:
                 if phase.camera_start is not None and phase.camera_end is not None:
                     if phase.start_us <= time_us < phase.end_us:
                         fraction = (time_us - phase.start_us) / max(1, phase.duration_us)
@@ -1145,12 +1160,29 @@ def _build_advanced_schedule(strokes: tuple[Stroke, ...], plan: DrawImagePlan, s
     pauses = [effect_configs.get(left.object_id, ObjectEffectConfig("", "draw", "draw", "auto", "auto", None, None)).pause_after_us if effect_configs.get(left.object_id) and effect_configs[left.object_id].pause_after_us is not None else global_pause for left in active[:-1]]
     transitions = [_transition_us(left, right) if left.effect == DrawObjectEffect.DRAW.value and right.effect == DrawObjectEffect.DRAW.value else 0 for left, right in zip(active, active[1:])]
 
-    # Precalculate camera targets and durations
+    # Precalculate camera targets, entrance staging, and durations
     cam_targets: dict[str, tuple[CameraState, str, bool]] = {}
     desired_cam_durations: dict[str, int] = {}
     desired_cam_holds: dict[str, int] = {}
+    desired_staging_durations: dict[str, int] = {}
+    staging_targets: dict[str, tuple[CameraState, str]] = {}
     cam_sim = FULL_VIEW_STATE
-    for group in active:
+
+    for index, group in enumerate(active):
+        if index > 0 and cam_sim != FULL_VIEW_STATE:
+            target_box = group.object_box or (scene.object_map[group.object_id].box if scene and group.object_id in scene.object_map else None)
+            coverage = _box_intersection_ratio(target_box, cam_sim.viewport)
+            if coverage < 0.40:
+                target_obj = scene.object_map.get(group.object_id)
+                st_tgt, st_src, _ = _resolve_camera_target("pan_to", target_obj, "camera_frame", cam_sim, canvas_aspect, pixel_size)
+                if _box_intersection_ratio(target_box, st_tgt.viewport) < 0.40:
+                    st_tgt, st_src, _ = _resolve_camera_target("focus", target_obj, "camera_frame", cam_sim, canvas_aspect, pixel_size)
+                if st_tgt != cam_sim:
+                    st_dur = _auto_camera_duration_us(cam_sim, st_tgt, "pan_to")
+                    desired_staging_durations[group.object_id] = st_dur
+                    staging_targets[group.object_id] = (st_tgt, st_src)
+                    cam_sim = st_tgt
+
         if group.object_id in camera_after_by_obj:
             cam_dir = camera_after_by_obj[group.object_id]
             target_obj = scene.object_map.get(cam_dir.target) if cam_dir.target else scene.object_map.get(cam_dir.object_id)
@@ -1173,8 +1205,9 @@ def _build_advanced_schedule(strokes: tuple[Stroke, ...], plan: DrawImagePlan, s
     local_finalize_total = local_reveal_us * draw_count
     total_cam_durations = sum(desired_cam_durations.values())
     total_cam_holds = sum(desired_cam_holds.values())
+    total_staging_durations = sum(desired_staging_durations.values())
 
-    fixed_total = sum(desired) + sum(pauses) + sum(transitions) + local_finalize_total + total_cam_durations + total_cam_holds
+    fixed_total = sum(desired) + sum(pauses) + sum(transitions) + local_finalize_total + total_cam_durations + total_cam_holds + total_staging_durations
     warnings = list(fallbacks)
 
     if fixed_total > budget and fixed_total:
@@ -1208,11 +1241,13 @@ def _build_advanced_schedule(strokes: tuple[Stroke, ...], plan: DrawImagePlan, s
         for k in desired_cam_durations:
             if camera_after_by_obj[k].duration_mode == "auto":
                 desired_cam_durations[k] = max(0, round(desired_cam_durations[k] * scale))
-        avail_for_effects = max(0, budget - local_finalize_total - sum(desired_cam_durations.values()) - sum(desired_cam_holds.values()) - sum(pauses) - sum(transitions))
+        for k in desired_staging_durations:
+            desired_staging_durations[k] = max(0, round(desired_staging_durations[k] * scale))
+        avail_for_effects = max(0, budget - local_finalize_total - sum(desired_cam_durations.values()) - sum(desired_cam_holds.values()) - sum(desired_staging_durations.values()) - sum(pauses) - sum(transitions))
         desired = _allocate_weighted(avail_for_effects, desired)
         warnings.append(ObjectEffectFallback("__schedule__", "", "", "", f"requested sequence duration {fixed_total / 1_000_000:.3f}s exceeded sketch budget; scaled by {scale:.3f}"))
 
-    used = sum(desired) + sum(pauses) + sum(transitions) + local_finalize_total + sum(desired_cam_durations.values()) + sum(desired_cam_holds.values())
+    used = sum(desired) + sum(pauses) + sum(transitions) + local_finalize_total + sum(desired_cam_durations.values()) + sum(desired_cam_holds.values()) + sum(desired_staging_durations.values())
     remaining = max(0, budget - used)
     if auto_draw:
         extras = _allocate_weighted(remaining, [active[index].path_length or len(active[index].strokes) or 1 for index in auto_draw])
@@ -1230,6 +1265,15 @@ def _build_advanced_schedule(strokes: tuple[Stroke, ...], plan: DrawImagePlan, s
     last_point = None
 
     for index, group in enumerate(active):
+        # Stage camera if upcoming object would be cropped/off-screen
+        if group.object_id in staging_targets and cam_state != staging_targets[group.object_id][0]:
+            st_tgt, st_src = staging_targets[group.object_id]
+            st_dur = desired_staging_durations.get(group.object_id, 0)
+            if st_dur > 0:
+                phases.append(SchedulePhase("camera_staging", cursor, cursor + st_dur, index, group.object_id, camera_start=cam_state, camera_end=st_tgt, camera_easing="ease_in_out", camera_action="staging_pan", camera_target=group.object_id, framing_source="staging_" + st_src))
+                cursor += st_dur
+            cam_state = st_tgt
+
         if index > 0 and transitions[index - 1] > 0:
             travel = transitions[index - 1]
             prev_group = active[index - 1]
@@ -1523,19 +1567,19 @@ class DrawRenderer:
             "",
             "Groups & Per-Object Lifecycle:",
         ]
-        group_phases: dict[int, SchedulePhase] = {}
+        group_phases: dict[str, SchedulePhase] = {}
         camera_phases_by_obj: dict[str, SchedulePhase] = {}
         camera_hold_phases_by_obj: dict[str, SchedulePhase] = {}
         for phase in schedule.phases:
-            if phase.kind == "object" and phase.group_index is not None:
-                group_phases[phase.group_index] = phase
+            if phase.kind == "object":
+                group_phases[phase.object_id] = phase
             elif phase.kind == "camera":
                 camera_phases_by_obj[phase.object_id] = phase
             elif phase.kind == "camera_hold":
                 camera_hold_phases_by_obj[phase.object_id] = phase
 
         for idx, group in enumerate(schedule.groups):
-            phase = group_phases.get(idx)
+            phase = group_phases.get(group.object_id)
             t_start = phase.start_us if phase else 0
             t_end = phase.end_us if phase else 0
             duration_s = (t_end - t_start) / 1_000_000
@@ -1570,6 +1614,15 @@ class DrawRenderer:
                 lines.append(f"  Object frame range: {t_start / 1_000_000:.2f} -> {t_end / 1_000_000:.2f} s ({duration_s:.3f}s)")
                 lines.append(f"  Hand: None")
                 lines.append(f"  DONE at: {t_end / 1_000_000:.2f} s")
+
+            if phase and group.object_box:
+                cam_at_start = phase.camera_start or FULL_VIEW_STATE
+                cov_mid = _box_intersection_ratio(group.object_box, cam_at_start.viewport) * 100.0
+                is_vis = "YES" if cov_mid >= 20.0 else "NO"
+                lines.append(f"  Camera viewport at effect start: ({cam_at_start.x:.3f}, {cam_at_start.y:.3f}, {cam_at_start.w:.3f}, {cam_at_start.h:.3f})")
+                lines.append(f"  Object bbox: ({group.object_box.x:.3f}, {group.object_box.y:.3f}, {group.object_box.w:.3f}, {group.object_box.h:.3f})")
+                lines.append(f"  Visible during entrance: {is_vis}")
+                lines.append(f"  Visible coverage at midpoint: {cov_mid:.1f}%")
 
             if group.object_id in camera_phases_by_obj:
                 cam = camera_phases_by_obj[group.object_id]

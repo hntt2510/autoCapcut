@@ -253,7 +253,13 @@ def test_camera_choreography_sequential_timeline() -> None:
 
 
 def test_camera_continuity_across_timeline() -> None:
-    scene = _make_test_scene()
+    # Two objects sharing a common area
+    objects = (
+        SceneObject("obj_a", "art", NormalizedRect(0.10, 0.10, 0.20, 0.40), NormalizedRect(0.05, 0.05, 0.60, 0.60), "draw"),
+        SceneObject("obj_b", "art", NormalizedRect(0.30, 0.10, 0.20, 0.40), NormalizedRect(0.05, 0.05, 0.60, 0.60), "push_in", "left"),
+        SceneObject("obj_c", "art", NormalizedRect(0.70, 0.10, 0.20, 0.40), NormalizedRect(0.50, 0.05, 0.50, 0.60), "draw"),
+    )
+    scene = SceneImage("001.png", (1920, 1080), objects, ("obj_a", "obj_b", "obj_c"))
     strokes = (
         Stroke(((0.15, 0.20), (0.25, 0.40)), object_id="obj_a"),
         Stroke(((0.75, 0.20), (0.85, 0.40)), object_id="obj_c"),
@@ -279,7 +285,7 @@ def test_camera_continuity_across_timeline() -> None:
     st_0 = _camera_state_at(schedule, plan, scene, 100_000, 16 / 9, (1920, 1080))
     assert st_0.viewport == FULL_VIEW_STATE.viewport
 
-    # During obj_b (which has no camera_after): camera must maintain obj_a's focused camera state (continuity!)
+    # During obj_b (which is within obj_a's camera frame): camera maintains obj_a's focused camera state (continuity!)
     cam_a_phase = next(p for p in schedule.phases if p.kind == "camera" and p.object_id == "obj_a")
     obj_b_phase = next(p for p in schedule.phases if p.kind == "object" and p.object_id == "obj_b")
 
@@ -412,3 +418,42 @@ def test_medicare_scene_camera_choreography_acceptance(tmp_path: Path) -> None:
     assert "Action: pan_to" in diag_text
     assert "Action: full_view" in diag_text
     assert "Final camera state:\n  FULL_VIEW" in diag_text
+
+
+def test_entrance_staging_pans_to_offscreen_upcoming_object() -> None:
+    # Scene where obj_1 is on the far left and obj_2 is on the far right
+    objects = (
+        SceneObject("left_hero", "art", NormalizedRect(0.05, 0.20, 0.25, 0.60), NormalizedRect(0.02, 0.10, 0.35, 0.80), "draw"),
+        SceneObject("right_card", "art", NormalizedRect(0.70, 0.20, 0.25, 0.60), NormalizedRect(0.65, 0.10, 0.35, 0.80), "slide_in", "right"),
+        SceneObject("final_badge", "art", NormalizedRect(0.40, 0.40, 0.20, 0.20), None, "draw"),
+    )
+    scene = SceneImage("001.png", (1920, 1080), objects, ("left_hero", "right_card", "final_badge"))
+    strokes = (
+        Stroke(((0.10, 0.25), (0.20, 0.45)), object_id="left_hero"),
+        Stroke(((0.45, 0.45), (0.55, 0.55)), object_id="final_badge"),
+    )
+    # CAMERA_AFTER focuses left_hero, which would leave right_card off-screen
+    camera_directives = (
+        CameraAfterDirective(object_id="left_hero", action="focus", target="left_hero", duration_us=500_000, duration_mode="fixed", hold_us=100_000),
+        CameraAfterDirective(object_id="final_badge", action="full_view", target="", duration_us=500_000, duration_mode="fixed"),
+    )
+    plan = DrawImagePlan(
+        1,
+        "001.png",
+        0,
+        5_000_000,
+        DrawMode.ADVANCED,
+        DrawStyle.V2,
+        "manual",
+        (DrawAction(DrawActionType.DRAW, 0, 5_000_000, {"final": "line_then_color"}),),
+        camera_after=camera_directives,
+    )
+    schedule = _build_advanced_schedule(strokes, plan, scene, (1920, 1080))
+
+    staging_phases = [p for p in schedule.phases if p.kind == "camera_staging"]
+    assert len(staging_phases) == 2
+    assert [p.object_id for p in staging_phases] == ["right_card", "final_badge"]
+    assert staging_phases[0].camera_action == "staging_pan"
+    # End of staging for right_card frames right_card
+    assert staging_phases[0].camera_end.x >= 0.50
+
