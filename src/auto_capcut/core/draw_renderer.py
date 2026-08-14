@@ -297,17 +297,36 @@ def _remove_simple_background(image: Image.Image) -> Image.Image | None:
     except Exception:
         return None
 
+def _hash_signature(*parts: Any) -> str:
+    digest = hashlib.sha256()
+    for part in parts:
+        digest.update(str(part).encode("utf-8"))
+    return digest.hexdigest()[:20]
 
-def _save_strokes(path: Path, strokes: Iterable[Stroke]) -> list[str]:
-    items = list(strokes)
-    offsets = [0]
-    points: list[tuple[float, float]] = []
+
+def _ease_out(value: float) -> float:
+    value = max(0.0, min(1.0, value))
+    return 1.0 - (1.0 - value) ** 3
+
+
+def _save_strokes(path: Path, strokes: Iterable[Stroke]) -> None:
+    points_list: list[float] = []
+    offsets: list[int] = [0]
     objects: list[str] = []
-    for stroke in items:
-        points.extend(stroke.points)
-        offsets.append(len(points))
+    for stroke in strokes:
+        for point in stroke.points:
+            points_list.extend(point)
+        offsets.append(len(points_list) // 2)
         objects.append(stroke.object_id)
-    np.savez_compressed(path, points=np.asarray(points, dtype=np.float32), offsets=np.asarray(offsets, dtype=np.int32))
+    np.savez_compressed(path, points=np.asarray(points_list, dtype=np.float32).reshape(-1, 2), offsets=np.asarray(offsets, dtype=np.int32), objects=np.asarray(objects, dtype=object))
+
+
+def _stroke_objects(path: Path) -> list[str]:
+    with np.load(path, allow_pickle=True) as archive:
+        if "objects" in archive:
+            objects = [str(value) for value in archive["objects"]]
+        else:
+            objects = []
     return objects
 
 
@@ -384,7 +403,7 @@ def prepare_image(image_path: Path, cache_root: Path, style: DrawStyle, text_mod
     if foreground:
         foreground.save(folder / "foreground.png", format="PNG")
     _save_strokes(folder / "strokes.npz", strokes)
-    (folder / "manifest.json").write_text(json.dumps({"algorithm": ALGORITHM_VERSION, "source_hash": source_hash, "size": cleaned.size, "stroke_objects": []}, indent=2), encoding="utf-8")
+    (folder / "manifest.json").write_text(json.dumps({"algorithm": ALGORITHM_VERSION, "source_hash": source_hash, "size": cleaned.size, "stroke_objects": _stroke_objects(folder / "strokes.npz")}, indent=2), encoding="utf-8")
     return ProcessedImage(source_hash, folder, folder / "cleaned.png", folder / "line.png", folder / "text_mask.png", folder / "foreground.png" if foreground else None, tuple(strokes))
 
 
@@ -438,14 +457,13 @@ def _reconstruct_background_patch(source: Image.Image, box: tuple[int, int, int,
     return Image.fromarray(patch, mode="RGB")
 
 
-def _prepare_object_layer(artifact: ProcessedImage, obj, cache_root: Path) -> ObjectLayerArtifact:
+def _prepare_object_layer(artifact: ProcessedImage, obj, cache_root: Path, other_boxes: tuple[NormalizedRect, ...] = ()) -> ObjectLayerArtifact:
     with Image.open(artifact.cleaned_path) as opened:
         source = opened.convert("RGB")
     size = source.size
     box = _box_pixels(obj.box, size)
-    # Geometry-only identity lets a renamed object reuse the same transparent
-    # extraction while changing one ROI invalidates only that ROI's cache.
-    signature = _hash_signature(OBJECT_EFFECT_PREPROCESS_VERSION, artifact.source_hash, obj.box, size)
+    canvas_bg = _estimate_canvas_background(source)
+    signature = _hash_signature(OBJECT_EFFECT_PREPROCESS_VERSION, artifact.source_hash, obj.box, size, other_boxes)
     folder = artifact.folder / "objects" / OBJECT_EFFECT_PREPROCESS_VERSION / signature
     manifest_path = folder / "manifest.json"
     rgba_path = folder / "object_rgba.png"
@@ -473,7 +491,7 @@ def _prepare_object_layer(artifact: ProcessedImage, obj, cache_root: Path) -> Ob
                     raise ValueError("cached object alpha metrics do not match manifest")
                 if "border_background_ratio" in manifest and abs(cached_border_ratio - float(manifest["border_background_ratio"])) > 0.02:
                     raise ValueError("cached object border metrics do not match manifest")
-                if manifest.get("safe") and (cached_coverage < 0.01 or cached_coverage > 0.95 or cached_border_ratio < 0.50):
+                if manifest.get("safe") and (cached_coverage < 0.005 or cached_coverage > 0.90 or cached_border_ratio < 0.40):
                     raise ValueError("cached object alpha mask no longer passes safety checks")
             with Image.open(patch_path) as cached_patch:
                 cached_patch.verify()
@@ -490,16 +508,31 @@ def _prepare_object_layer(artifact: ProcessedImage, obj, cache_root: Path) -> Ob
     ring_mask[top - expanded[1]:bottom - expanded[1], left - expanded[0]:right - expanded[0]] = False
     ring_pixels = sample[ring_mask]
     confidence = 0.0
-    reason = "background ring is empty"
-    median = np.asarray([255, 255, 255], dtype=np.float32)
+    median = np.asarray(canvas_bg[:3], dtype=np.float32)
     if len(ring_pixels):
-        median = np.median(ring_pixels, axis=0)
-        distances = np.linalg.norm(ring_pixels.astype(np.float32) - median, axis=1)
+        sample_median = np.median(ring_pixels, axis=0)
+        distances = np.linalg.norm(ring_pixels.astype(np.float32) - sample_median, axis=1)
         confidence = float(np.mean(distances <= 24.0))
-        reason = "" if confidence >= 0.80 else f"background confidence {confidence:.3f} is below 0.800"
+        if confidence >= 0.70:
+            median = sample_median
+    else:
+        confidence = 0.85
+
     crop = pixels[top:bottom, left:right].astype(np.float32)
     crop_distance = np.linalg.norm(crop - median, axis=2)
-    candidates = crop_distance <= 24.0
+
+    # Exclude other scene objects from this object's foreground
+    exclusion_mask = np.zeros(crop.shape[:2], dtype=bool)
+    for other_b in other_boxes:
+        o_left, o_top, o_right, o_bottom = _box_pixels(other_b, size)
+        int_l = max(left, o_left) - left
+        int_r = min(right, o_right) - left
+        int_t = max(top, o_top) - top
+        int_b = min(bottom, o_bottom) - top
+        if int_l < int_r and int_t < int_b:
+            exclusion_mask[int_t:int_b, int_l:int_r] = True
+
+    candidates = (crop_distance <= 20.0) | exclusion_mask
     try:
         import cv2
 
@@ -508,10 +541,14 @@ def _prepare_object_layer(artifact: ProcessedImage, obj, cache_root: Path) -> Ob
         if labels_count > 1:
             border_labels = np.unique(np.concatenate((labels[0], labels[-1], labels[:, 0], labels[:, -1])))
             background = np.isin(labels, border_labels[border_labels != 0])
-        alpha_binary = (~background).astype(np.uint8)
-        distances = cv2.distanceTransform(alpha_binary, cv2.DIST_L2, 3).astype(np.float32)
-        # Clamp before multiplying; OpenCV returns a very large sentinel for
-        # an all-foreground mask, which would otherwise overflow float32.
+        fg_binary = ((~background) & (~exclusion_mask)).astype(np.uint8)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        fg_binary = cv2.morphologyEx(fg_binary, cv2.MORPH_CLOSE, kernel)
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(fg_binary, connectivity=8)
+        for i in range(1, num_labels):
+            if stats[i, cv2.CC_STAT_AREA] < 25:
+                fg_binary[labels == i] = 0
+        distances = cv2.distanceTransform(fg_binary, cv2.DIST_L2, 3).astype(np.float32)
         feather = np.round(np.minimum(distances, 2.0) / 2.0 * 255.0)
         alpha = np.where(distances >= 2.0, 255.0, np.where(distances > 0, feather, 0.0)).astype(np.uint8)
     except ImportError:
@@ -532,28 +569,24 @@ def _prepare_object_layer(artifact: ProcessedImage, obj, cache_root: Path) -> Ob
             for next_y, next_x in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
                 if 0 <= next_y < height and 0 <= next_x < width and candidates[next_y, next_x] and not background[next_y, next_x]:
                     queue.append((next_y, next_x))
-        alpha = np.where(~background, 255, 0).astype(np.uint8)
+        alpha = np.where((~background) & (~exclusion_mask), 255, 0).astype(np.uint8)
+
     alpha_coverage = float(np.mean(alpha > 0))
     border_alpha = np.concatenate((alpha[0], alpha[-1], alpha[:, 0], alpha[:, -1]))
     border_background_ratio = float(np.mean(border_alpha == 0)) if len(border_alpha) else 0.0
-    # A mostly opaque crop border is a strong signal that the ROI was cut
-    # through the object.  Falling back to draw is safer than moving a visible
-    # rectangular patch in that case.
-    safe = confidence >= 0.80 and 0.01 <= alpha_coverage <= 0.95 and border_background_ratio >= 0.50
-    if safe:
-        reason = ""
-    elif confidence < 0.80:
-        reason = f"background confidence {confidence:.3f} is below 0.800"
-    elif alpha_coverage < 0.01:
-        reason = f"foreground alpha coverage {alpha_coverage:.3f} is too small"
-    elif alpha_coverage > 0.95:
-        reason = f"foreground alpha coverage {alpha_coverage:.3f} is too large"
-    else:
-        reason = f"crop-border background ratio {border_background_ratio:.3f} is too small"
+    safe = confidence >= 0.70 and 0.005 <= alpha_coverage <= 0.90 and border_background_ratio >= 0.40
+    reason = ""
+    if not safe:
+        if confidence < 0.70:
+            reason = f"background confidence {confidence:.3f} is below 0.700"
+        elif alpha_coverage < 0.005:
+            reason = f"foreground alpha coverage {alpha_coverage:.3f} is too small"
+        elif alpha_coverage > 0.90:
+            reason = f"foreground alpha coverage {alpha_coverage:.3f} is too large"
+        else:
+            reason = f"crop-border background ratio {border_background_ratio:.3f} is too small"
     rgba = np.dstack((crop.astype(np.uint8), alpha))
     Image.fromarray(rgba, mode="RGBA").save(rgba_path, format="PNG")
-    # Keep the historical filename as a compatibility alias for existing
-    # cache inspectors; both files contain the transparent RGBA layer.
     Image.fromarray(rgba, mode="RGBA").save(folder / "crop.png", format="PNG")
     _reconstruct_background_patch(source, box, ring).save(patch_path, format="PNG")
     manifest_path.write_text(json.dumps({"version": OBJECT_EFFECT_PREPROCESS_VERSION, "source_hash": artifact.source_hash, "source_size": list(size), "box": [left, top, right, bottom], "background_rgb": [float(value) for value in median], "confidence": confidence, "alpha_coverage": alpha_coverage, "border_background_ratio": border_background_ratio, "safe": safe, "reason": reason}, indent=2), encoding="utf-8")
@@ -567,8 +600,9 @@ def _prepare_object_layers(artifact: ProcessedImage, scene: SceneImage, configs:
     for obj in scene.objects:
         config = resolved[obj.id]
         is_draw = config.effective_effect == DrawObjectEffect.DRAW.value
+        other_boxes = tuple(other.box for other in scene.objects if other.id != obj.id)
         try:
-            layer = _prepare_object_layer(artifact, obj, artifact.folder)
+            layer = _prepare_object_layer(artifact, obj, artifact.folder, other_boxes)
             layers[obj.id] = layer
         except Exception as exc:
             if not is_draw:
@@ -1277,11 +1311,12 @@ class DrawRenderer:
         source_size: tuple[int, int],
         canvas_bg: tuple[int, int, int],
         is_text: bool = False,
+        exclusion_rects: tuple[tuple[int, int, int, int], ...] = (),
     ) -> Image.Image:
         h, w = crop_rgb.shape[:2]
         left, top, right, bottom = box_pixels
 
-        # 1. Use extracted layer alpha mask if valid
+        # 1. Use extracted layer alpha mask if valid and safe
         if layer is not None and layer.rgba_path.is_file():
             try:
                 with Image.open(layer.rgba_path) as layer_img:
@@ -1290,29 +1325,26 @@ class DrawRenderer:
                     coverage = float(np.mean(alpha > 0))
                     border = np.concatenate((alpha[0], alpha[-1], alpha[:, 0], alpha[:, -1]))
                     border_bg = float(np.mean(border == 0)) if len(border) else 0.0
-                    if 0.005 <= coverage <= 0.98 and border_bg >= 0.25:
+                    if 0.005 <= coverage <= 0.90 and border_bg >= 0.40:
                         return Image.fromarray(alpha, mode="L")
             except Exception:
                 pass
 
-        # 2. Derive deterministic border-connected background removal mask
-        ring = max(1, min(6, min(h, w) // 20))
-        border_samples = np.concatenate((
-            crop_rgb[:ring].reshape(-1, 3),
-            crop_rgb[-ring:].reshape(-1, 3),
-            crop_rgb[:, :ring].reshape(-1, 3),
-            crop_rgb[:, -ring:].reshape(-1, 3),
-        ), axis=0)
-        local_median = np.median(border_samples, axis=0)
-        local_std = np.std(border_samples, axis=0)
-        if float(np.mean(local_std)) < 30.0:
-            bg_ref = local_median
-        else:
-            bg_ref = np.asarray(canvas_bg[:3], dtype=np.float32)
-
+        # 2. Derive deterministic border-connected background removal mask with exclusion rects
+        bg_ref = np.asarray(canvas_bg[:3], dtype=np.float32)
         diff = np.linalg.norm(crop_rgb.astype(np.float32) - bg_ref, axis=2)
-        thresh = 14.0 if is_text else 16.0
-        fg_candidates = diff > thresh
+
+        exclusion_mask = np.zeros((h, w), dtype=bool)
+        for o_l, o_t, o_r, o_b in exclusion_rects:
+            int_l = max(left, o_l) - left
+            int_r = min(right, o_r) - left
+            int_t = max(top, o_t) - top
+            int_b = min(bottom, o_b) - top
+            if int_l < int_r and int_t < int_b:
+                exclusion_mask[int_t:int_b, int_l:int_r] = True
+
+        thresh = 14.0 if is_text else 18.0
+        candidates = (diff <= thresh) | exclusion_mask
 
         stroke_mask = np.zeros((h, w), dtype=bool)
         if strokes:
@@ -1323,33 +1355,32 @@ class DrawRenderer:
                 pts = [(round(x * source_size[0] - left), round(y * source_size[1] - top)) for x, y in stroke.points]
                 if len(pts) > 1:
                     s_draw.line(pts, fill=255, width=line_w, joint="curve")
-            stroke_mask = np.asarray(s_img) > 0
+            stroke_mask = (np.asarray(s_img) > 0) & (~exclusion_mask)
 
         try:
             import cv2
 
-            bg_candidates = (~fg_candidates).astype(np.uint8)
-            labels_count, labels = cv2.connectedComponents(bg_candidates, connectivity=4)
+            labels_count, labels = cv2.connectedComponents(candidates.astype(np.uint8), connectivity=4)
             bg_connected = np.zeros((h, w), dtype=bool)
             if labels_count > 1:
                 border_labels = np.unique(np.concatenate((labels[0], labels[-1], labels[:, 0], labels[:, -1])))
                 border_labels = border_labels[border_labels != 0]
                 bg_connected = np.isin(labels, border_labels)
 
-            fg_mask = (~bg_connected) | stroke_mask
+            fg_mask = ((~bg_connected) & (~exclusion_mask)) | stroke_mask
             fg_binary = fg_mask.astype(np.uint8)
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
             fg_binary = cv2.morphologyEx(fg_binary, cv2.MORPH_CLOSE, kernel)
+            num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(fg_binary, connectivity=8)
+            for i in range(1, num_labels):
+                if stats[i, cv2.CC_STAT_AREA] < 25:
+                    fg_binary[labels == i] = 0
             distances = cv2.distanceTransform(fg_binary, cv2.DIST_L2, 3).astype(np.float32)
             feather = np.round(np.minimum(distances, 2.0) / 2.0 * 255.0)
             alpha = np.where(distances >= 2.0, 255.0, np.where(distances > 0, feather, 0.0)).astype(np.uint8)
-            alpha[0, :] = np.where(bg_connected[0, :], 0, alpha[0, :])
-            alpha[-1, :] = np.where(bg_connected[-1, :], 0, alpha[-1, :])
-            alpha[:, 0] = np.where(bg_connected[:, 0], 0, alpha[:, 0])
-            alpha[:, -1] = np.where(bg_connected[:, -1], 0, alpha[:, -1])
             return Image.fromarray(alpha, mode="L")
         except ImportError:
-            fg_mask = fg_candidates | stroke_mask
+            fg_mask = (diff > thresh) & (~exclusion_mask) | stroke_mask
             alpha = np.where(fg_mask, 255, 0).astype(np.uint8)
             return Image.fromarray(alpha, mode="L").filter(ImageFilter.GaussianBlur(radius=1.0))
 
@@ -1430,6 +1461,7 @@ class DrawRenderer:
                             crop_orig = original.crop((left, top, right, bottom))
                             crop_arr = np.asarray(crop_orig.convert("RGB"))
                             is_text_obj = group.object_type == "text"
+                            other_rects = tuple(_box_pixels(other.box, original.size) for other in scene.objects if other.id != group.object_id)
                             fg_mask = self._get_draw_foreground_mask(
                                 crop_arr,
                                 group.layer,
@@ -1438,6 +1470,7 @@ class DrawRenderer:
                                 original.size,
                                 canvas_bg[:3],
                                 is_text=is_text_obj,
+                                exclusion_rects=other_rects,
                             )
                             if is_text_obj and text_mode in {TextMode.KEEP, TextMode.SIMPLIFIED} and progress > 0 and time_us < phase.end_us:
                                 text_mask = fg_mask.point(lambda v: round(v * progress)) if text_mode is TextMode.SIMPLIFIED else fg_mask
