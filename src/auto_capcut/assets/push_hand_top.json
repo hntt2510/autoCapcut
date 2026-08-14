@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "contact_anchor": {"x": 0.50, "y": 0.88},
+  "supported_orientation": ["top_to_bottom"]
+}

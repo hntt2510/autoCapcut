@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "auto-capcut"
+version = "0.1.0"
+description = "A compact Windows utility for generating editable CapCut drafts."
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "PyQt6>=6.7,<7",
+  "pycapcut==0.0.3",
+  "Pillow>=10,<13",
+  "numpy>=1.26,<3",
+  "opencv-python-headless>=4.10,<5",
+  "imageio-ffmpeg>=0.6,<1",
+]
+
+[project.scripts]
+auto-capcut = "auto_capcut.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+auto_capcut = ["assets/*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
