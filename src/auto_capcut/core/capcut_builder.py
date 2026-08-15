@@ -254,7 +254,9 @@ class CapCutBuilder:
             fallback_basic=job.config.draw_fallback_basic,
             advanced_diagnostics=job.config.draw_diagnostics,
             reuse_cache=job.config.draw_reuse_cache,
+            post_motion=job.config.motion_mode if job.config.motion_enabled else "none",
         )
+
 
         progress(20, f"Rendering {len(draw_indexes)} draw clip(s)...")
 

@@ -189,8 +189,13 @@ class DrawSchedule:
         return max(0, self.color_end_us - self.color_start_us)
 
     @property
+    def draw_end_us(self) -> int:
+        return self.color_end_us
+
+    @property
     def warnings(self) -> tuple[str, ...]:
         return tuple(item.reason for item in self.fallbacks if item.reason)
+
 
 
 def _hash_signature(*parts: object) -> str:
@@ -807,6 +812,24 @@ def _auto_camera_return_duration_us(start_state: CameraState, end_state: CameraS
     return round(max(0.35, min(0.55, dur_s)) * 1_000_000)
 
 
+def calculate_completion_buffer_us(duration_us: int, explicit_buffer_us: int | None = None) -> int:
+    """Calculate the completion buffer at the end of a cue.
+
+    Default completion buffer:
+    - use COMPLETE_BEFORE_END when specified
+    - otherwise use clamp(25% of cue duration, min=1.5s, max=3.0s)
+    """
+    if explicit_buffer_us is not None:
+        buf = explicit_buffer_us
+    else:
+        target = round(duration_us * 0.25)
+        buf = max(1_500_000, min(3_000_000, target))
+    if duration_us < 2_500_000:
+        buf = min(buf, round(duration_us * 0.35))
+    buf = min(buf, max(0, duration_us - 500_000))
+    return max(0, buf)
+
+
 def _camera_state_at(
     schedule: DrawSchedule,
     plan: DrawImagePlan,
@@ -814,6 +837,7 @@ def _camera_state_at(
     time_us: int,
     canvas_aspect: float,
     source_size: tuple[int, int],
+    project_post_motion: str = "none",
 ) -> CameraState:
     camera_phases = [p for p in schedule.phases if p.kind in {"camera", "camera_hold", "camera_staging", "camera_return"}]
     current_state = FULL_VIEW_STATE
@@ -855,7 +879,54 @@ def _camera_state_at(
             return _interpolate_camera_state(current_state, target_state, fraction, easing)
         current_state = target_state
 
+    # Post-draw motion preset applied during the completion buffer [schedule.draw_end_us, plan.duration_us]
+    if time_us >= schedule.draw_end_us and plan.duration_us > schedule.draw_end_us:
+        buffer_duration = plan.duration_us - schedule.draw_end_us
+        progress = min(1.0, max(0.0, (time_us - schedule.draw_end_us) / max(1, buffer_duration)))
+        eased_progress = progress * progress * (3.0 - 2.0 * progress)
+        raw_pm = plan.post_motion if plan.post_motion is not None else project_post_motion
+        pm = (raw_pm or "").strip().casefold()
+        legacy_map = {
+            "random light": "random_light",
+            "subtle zoom in": "subtle_zoom_in",
+            "subtle zoom out": "subtle_zoom_out",
+            "subtle pan left": "subtle_pan_left",
+            "subtle pan right": "subtle_pan_right",
+        }
+        pm = legacy_map.get(pm, pm)
+
+        if pm == "random_light":
+            modes = ["subtle_zoom_in", "subtle_zoom_out", "subtle_pan_left", "subtle_pan_right"]
+            pm = modes[plan.image_index % len(modes)]
+
+        if pm == "subtle_zoom_in":
+            scale = 1.0 + 0.05 * eased_progress
+            w = 1.0 / scale
+            h = 1.0 / scale
+            return CameraState(((1.0 - w) / 2.0, (1.0 - h) / 2.0, w, h))
+        elif pm == "subtle_zoom_out":
+            scale = 1.05 - 0.05 * eased_progress
+            w = 1.0 / scale
+            h = 1.0 / scale
+            return CameraState(((1.0 - w) / 2.0, (1.0 - h) / 2.0, w, h))
+        elif pm == "subtle_pan_left":
+            scale = 1.05
+            w = 1.0 / scale
+            h = 1.0 / scale
+            y = (1.0 - h) / 2.0
+            x = (1.0 - w) * (1.0 - eased_progress)
+            return CameraState((x, y, w, h))
+        elif pm == "subtle_pan_right":
+            scale = 1.05
+            w = 1.0 / scale
+            h = 1.0 / scale
+            y = (1.0 - h) / 2.0
+            x = (1.0 - w) * eased_progress
+            return CameraState((x, y, w, h))
+
+
     return current_state
+
 
 
 def _viewport_at(plan: DrawImagePlan, scene: SceneImage | None, time_us: int, aspect: float) -> tuple[float, float, float, float]:
@@ -1111,9 +1182,11 @@ def _auto_effect_duration(config: ObjectEffectConfig, group: ScheduledGroup) -> 
 
 def _build_advanced_schedule(strokes: tuple[Stroke, ...], plan: DrawImagePlan, scene: SceneImage, source_size: tuple[int, int] | None = None, text_mode: TextMode = TextMode.KEEP, effect_configs: dict[str, ObjectEffectConfig] | None = None, layers: dict[str, ObjectLayerArtifact] | None = None, fallbacks: tuple[ObjectEffectFallback, ...] = ()) -> DrawSchedule:
     draw = plan.draw_action
+    buffer_us = calculate_completion_buffer_us(plan.duration_us, plan.complete_before_end_us)
+    draw_effective_end_us = max(1, plan.duration_us - buffer_us)
     final_mode = FinalRevealMode(draw.params.get("final", FinalRevealMode.LINE_THEN_COLOR.value).casefold())
-    color_duration = min(200_000, max(1, draw.duration_us // 4)) if final_mode is FinalRevealMode.LINE_THEN_COLOR else 0
-    color_start = draw.end_us - color_duration
+    color_duration = min(200_000, max(1, draw_effective_end_us // 4)) if final_mode is FinalRevealMode.LINE_THEN_COLOR else 0
+    color_start = max(0, draw_effective_end_us - color_duration)
     order = _resolved_object_order(plan, scene)
     assigned, unmatched = _assign_strokes_to_objects(strokes, scene, order)
     pixel_size = source_size or scene.source_size
@@ -1270,9 +1343,14 @@ def _build_advanced_schedule(strokes: tuple[Stroke, ...], plan: DrawImagePlan, s
                 desired_cam_returns[k] = max(0, round(desired_cam_returns[k] * scale))
         for k in desired_staging_durations:
             desired_staging_durations[k] = max(0, round(desired_staging_durations[k] * scale))
+        local_reveal_us = max(0, round(local_reveal_us * scale))
+        local_finalize_total = local_reveal_us * draw_count
+        pauses = [max(0, round(p * scale)) for p in pauses]
+        transitions = [max(0, round(t * scale)) for t in transitions]
         avail_for_effects = max(0, budget - local_finalize_total - sum(desired_cam_durations.values()) - sum(desired_cam_holds.values()) - sum(desired_cam_returns.values()) - sum(desired_staging_durations.values()) - sum(pauses) - sum(transitions))
         desired = _allocate_weighted(avail_for_effects, desired)
         warnings.append(ObjectEffectFallback("__schedule__", "", "", "", f"requested sequence duration {fixed_total / 1_000_000:.3f}s exceeded sketch budget; scaled by {scale:.3f}"))
+
 
     used = sum(desired) + sum(pauses) + sum(transitions) + local_finalize_total + sum(desired_cam_durations.values()) + sum(desired_cam_holds.values()) + sum(desired_cam_returns.values()) + sum(desired_staging_durations.values())
     remaining = max(0, budget - used)
@@ -1358,7 +1436,7 @@ def _build_advanced_schedule(strokes: tuple[Stroke, ...], plan: DrawImagePlan, s
         if not has_full_view_return:
             raise DrawParseError("Final reconciliation requires FULL_VIEW camera state. Add CAMERA_AFTER ... action=full_view or FULL_VIEW before final settle.")
 
-    return DrawSchedule(tuple(groups), tuple(phases), draw.start_us, color_start, color_start, draw.end_us, tuple(order), len(unmatched), policy, tuple(warnings))
+    return DrawSchedule(tuple(groups), tuple(phases), draw.start_us, color_start, color_start, draw_effective_end_us, tuple(order), len(unmatched), policy, tuple(warnings))
 
 
 def build_advanced_schedule(strokes: tuple[Stroke, ...], plan: DrawImagePlan, scene: SceneImage, source_size: tuple[int, int] | None = None, text_mode: TextMode = TextMode.KEEP) -> DrawSchedule:
@@ -1367,13 +1445,15 @@ def build_advanced_schedule(strokes: tuple[Stroke, ...], plan: DrawImagePlan, sc
 
 def _basic_schedule(strokes: tuple[Stroke, ...], plan: DrawImagePlan) -> DrawSchedule:
     ordered = tuple(sorted(strokes, key=lambda item: (item.center[1], item.center[0], -item.length)))
-    group = ScheduledGroup("", "art", ordered, 0, sum(item.length for item in ordered))
+    buffer_us = calculate_completion_buffer_us(plan.duration_us, plan.complete_before_end_us)
+    draw_effective_end_us = max(1, plan.duration_us - buffer_us)
     draw = plan.draw_action
-    color_duration = min(COLOR_REVEAL_MAX_US, max(1, draw.duration_us // 2)) if FinalRevealMode(draw.params.get("final", FinalRevealMode.LINE_THEN_COLOR.value).casefold()) is FinalRevealMode.LINE_THEN_COLOR else 0
-    color_start = draw.end_us - color_duration
-    group = ScheduledGroup(group.object_id, group.object_type, group.strokes, max(0, color_start - draw.start_us), group.path_length)
+    color_duration = min(COLOR_REVEAL_MAX_US, max(1, draw_effective_end_us // 2)) if FinalRevealMode(draw.params.get("final", FinalRevealMode.LINE_THEN_COLOR.value).casefold()) is FinalRevealMode.LINE_THEN_COLOR else 0
+    color_start = max(0, draw_effective_end_us - color_duration)
+    group = ScheduledGroup("", "art", ordered, max(0, color_start - draw.start_us), sum(item.length for item in ordered))
     phase = (SchedulePhase("object", draw.start_us, color_start, 0, ""),) if ordered and color_start > draw.start_us else ()
-    return DrawSchedule((group,), phase, draw.start_us, color_start, color_start, draw.end_us)
+    return DrawSchedule((group,), phase, draw.start_us, color_start, color_start, draw_effective_end_us)
+
 
 
 def _ordered_strokes(strokes: tuple[Stroke, ...], plan: DrawImagePlan, scene: SceneImage | None) -> list[Stroke]:
@@ -1449,11 +1529,14 @@ def _clip_signature(
     resolution: tuple[int, int],
     fps: int,
     remove_background: bool,
+    post_motion: str = "none",
 ) -> str:
     plan_dict = {
         "mode": plan.mode.value,
         "style": plan.style.value,
         "duration_us": plan.duration_us,
+        "complete_before_end_us": plan.complete_before_end_us,
+        "post_motion": plan.post_motion or post_motion,
         "actions": [
             {
                 "type": a.type.value,
@@ -1520,7 +1603,9 @@ def _clip_signature(
         resolution[1],
         fps,
         remove_background,
+        post_motion,
     )
+
 
 
 def _validate_advanced_plan_targets(plan: DrawImagePlan, scene: SceneImage) -> None:
@@ -1919,7 +2004,8 @@ class DrawRenderer:
             alpha = np.where(fg_mask, 255, 0).astype(np.uint8)
             return Image.fromarray(alpha, mode="L").filter(ImageFilter.GaussianBlur(radius=1.0))
 
-    def _frame(self, artifact: ProcessedImage, plan: DrawImagePlan, scene: SceneImage | None, time_us: int, size: tuple[int, int], strokes: list[Stroke] | DrawSchedule) -> Image.Image:
+    def _frame(self, artifact: ProcessedImage, plan: DrawImagePlan, scene: SceneImage | None, time_us: int, size: tuple[int, int], strokes: list[Stroke] | DrawSchedule, project_post_motion: str = "none") -> Image.Image:
+
         # The color layer is always the cleaned source RGB image.
         source = Image.open(artifact.cleaned_path).convert("RGBA")
         canvas_bg = _estimate_canvas_background(source)
@@ -2081,7 +2167,7 @@ class DrawRenderer:
                         frame = Image.blend(frame, original, color_fraction)
 
         canvas_aspect = size[0] / max(1, size[1])
-        camera_state = _camera_state_at(schedule, plan, scene, time_us, canvas_aspect, original.size)
+        camera_state = _camera_state_at(schedule, plan, scene, time_us, canvas_aspect, original.size, project_post_motion)
         viewport = camera_state.viewport
         result = _crop(frame, viewport, size)
 
@@ -2117,7 +2203,7 @@ class DrawRenderer:
         artifact = prepare_image(image_path, cache_root, plan.style, text_mode, config.remove_background, scene)
 
         # Check rendered clip cache
-        clip_sig = _clip_signature(artifact.source_hash, plan, scene, config.resolution, config.fps, config.remove_background)
+        clip_sig = _clip_signature(artifact.source_hash, plan, scene, config.resolution, config.fps, config.remove_background, config.post_motion)
         cached_clip = cache_root / "rendered_clips" / f"{clip_sig}.mp4"
         if config.reuse_cache and cached_clip.is_file() and cached_clip.stat().st_size > 0:
             LOGGER.info("Reusing cached draw render for %s (signature %s)", image_path.name, clip_sig[:12])
@@ -2172,7 +2258,7 @@ class DrawRenderer:
             assert process.stdin is not None
             for index in range(frames):
                 time_us = min(plan.duration_us, round((index + 1) * 1_000_000 / config.fps))
-                frame = self._frame(artifact, plan, scene, time_us, (width, height), schedule)
+                frame = self._frame(artifact, plan, scene, time_us, (width, height), schedule, config.post_motion)
                 process.stdin.write(np.asarray(frame, dtype=np.uint8).tobytes())
                 if progress:
                     progress(20 + round((index + 1) / frames * 75), f"Rendering {image_path.name} ({index + 1}/{frames})")
@@ -2188,6 +2274,7 @@ class DrawRenderer:
                     shutil.copyfile(output_path, cached_clip)
             except OSError:
                 pass
+
         except BrokenPipeError as exc:
             stderr = process.stderr.read().decode("utf-8", "replace") if process.stderr else ""
             process.wait()

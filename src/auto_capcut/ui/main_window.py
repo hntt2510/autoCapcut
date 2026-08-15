@@ -96,14 +96,15 @@ class MainWindow(QMainWindow):
 
         motion = QGroupBox("VISUAL EFFECTS"); motion_form = QFormLayout(motion)
         self.motion_enabled = QCheckBox("Enable Visual Effects"); self.motion_enabled.setChecked(True)
-        self.motion_mode = QComboBox(); self.motion_mode.addItems(["None", "Random Light", "Subtle Zoom In", "Subtle Zoom Out", "Subtle Pan Left", "Subtle Pan Right", "Effect Direction SRT"])
+        self.motion_mode = QComboBox(); self.motion_mode.addItems(["None", "Random Light", "Subtle Zoom In", "Subtle Zoom Out", "Subtle Pan Left", "Subtle Pan Right"])
         self.effect_path = QLineEdit(); effect_browse = QPushButton("Browse"); effect_browse.clicked.connect(lambda: self._browse_file(self.effect_path, "SRT files (*.srt)")); effect_row = QHBoxLayout(); effect_row.addWidget(self.effect_path); effect_row.addWidget(effect_browse)
         self.effect_status = QLabel("Effect status: not selected"); self.effect_status.setWordWrap(True)
         self.roi_status = QLabel("Camera Frame status: not selected"); self.roi_status.setWordWrap(True)
         self.edit_roi_button = QPushButton("Edit Camera Frames"); self.edit_roi_button.clicked.connect(self._edit_roi)
         self.motion_strength = QComboBox(); self.motion_strength.addItems([strength.value for strength in MotionStrength])
-        motion_form.addRow(self.motion_enabled); motion_form.addRow("Effect mode", self.motion_mode); motion_form.addRow("Effect Direction SRT", effect_row)
+        motion_form.addRow(self.motion_enabled); motion_form.addRow("Post-draw motion", self.motion_mode); motion_form.addRow("Effect Direction SRT", effect_row)
         motion_form.addRow("Effect status", self.effect_status); motion_form.addRow("Camera Frame status", self.roi_status); motion_form.addRow(self.edit_roi_button); motion_form.addRow("Motion strength", self.motion_strength); layout.addWidget(motion)
+
 
         transitions = QGroupBox("TRANSITIONS"); transition_form = QFormLayout(transitions); self.transition_enabled = QCheckBox("Enable Transitions"); self.transition_enabled.setChecked(True); self.transition_type = QComboBox(); self.transition_type.addItem("Blur"); self.transition_duration = QDoubleSpinBox(); self.transition_duration.setRange(0.01, 5.0); self.transition_duration.setSingleStep(0.05); self.transition_duration.setValue(0.30)
         transition_form.addRow(self.transition_enabled); transition_form.addRow("Transition", self.transition_type); transition_form.addRow("Duration (s)", self.transition_duration); layout.addWidget(transitions)
@@ -291,10 +292,6 @@ class MainWindow(QMainWindow):
         self._update_draw_scene_status()
 
     def _update_effect_status(self) -> None:
-        if self.motion_mode.currentText() != "Effect Direction SRT":
-            self.effect_status.setText("Effect status: not selected")
-            self.roi_status.setText("Camera Frame status: not selected")
-            return
         path = Path(self.effect_path.text()) if self.effect_path.text() else None
         if path is None or not path.is_file():
             self.effect_status.setText("Effect status: choose an Effect Direction SRT")
@@ -359,11 +356,17 @@ class MainWindow(QMainWindow):
         self._edit_roi()
 
     def _update_enabled(self) -> None:
-        effect_mode = self.motion_enabled.isChecked() and self.motion_mode.currentText() == "Effect Direction SRT"
-        self.motion_mode.setEnabled(self.motion_enabled.isChecked()); self.effect_path.setEnabled(effect_mode); self.edit_roi_button.setEnabled(effect_mode and Path(self.effect_path.text()).is_file() and bool(self._current_images())); self.motion_strength.setEnabled(self.motion_enabled.isChecked()); self.transition_type.setEnabled(self.transition_enabled.isChecked()); self.transition_duration.setEnabled(self.transition_enabled.isChecked()); self.audio_path.setPlaceholderText("Folder containing audio files" if self.folder_audio.isChecked() else "Audio file")
+        self.motion_mode.setEnabled(self.motion_enabled.isChecked())
+        self.effect_path.setEnabled(True)
+        self.edit_roi_button.setEnabled(Path(self.effect_path.text()).is_file() and bool(self._current_images()))
+        self.motion_strength.setEnabled(self.motion_enabled.isChecked())
+        self.transition_type.setEnabled(self.transition_enabled.isChecked())
+        self.transition_duration.setEnabled(self.transition_enabled.isChecked())
+        self.audio_path.setPlaceholderText("Folder containing audio files" if self.folder_audio.isChecked() else "Audio file")
         draw_on = self.draw_enabled.isChecked()
         for w in (self.draw_source_label, self.draw_scene_path, self.edit_draw_objects_btn, self.draw_scene_status, self.draw_remove_bg, self.draw_fallback_basic, self.draw_diagnostics, self.draw_reuse_cache):
             w.setEnabled(draw_on)
+
 
 
     def _config(self) -> ProjectConfig:

@@ -63,15 +63,20 @@ def test_line_then_color_uses_full_frame_original_crossfade(tmp_path: Path) -> N
     image, plan, renderer = _line_then_color_fixture(tmp_path)
     artifact = prepare_image(image, renderer.cache_root, plan.style, TextMode.KEEP, False)
     strokes = _ordered_strokes(artifact.strokes, plan, None)
-    color_start = plan.duration_us - 600_000
+    from auto_capcut.core.draw_renderer import _basic_schedule
+    schedule = _basic_schedule(artifact.strokes, plan)
+    color_start = schedule.color_start_us
+    color_duration = schedule.color_duration_us
     sketch = renderer._frame(artifact, plan, None, color_start, (64, 64), strokes)
-    midpoint = renderer._frame(artifact, plan, None, color_start + 300_000, (64, 64), strokes)
+    midpoint = renderer._frame(artifact, plan, None, color_start + color_duration // 2, (64, 64), strokes)
     final = renderer._frame(artifact, plan, None, plan.duration_us, (64, 64), strokes)
     original = _crop(Image.open(artifact.cleaned_path).convert("RGB"), (0.0, 0.0, 1.0, 1.0), (64, 64))
     expected_midpoint = Image.blend(sketch.convert("RGBA"), original.convert("RGBA"), 0.5).convert("RGB")
     assert np.array_equal(np.asarray(midpoint), np.asarray(expected_midpoint))
     assert np.array_equal(np.asarray(final), np.asarray(original))
     assert not np.array_equal(np.asarray(sketch), np.asarray(original))
+
+
 
 
 def test_line_then_color_preserves_original_after_settle_and_short_draw_has_both_phases(tmp_path: Path) -> None:

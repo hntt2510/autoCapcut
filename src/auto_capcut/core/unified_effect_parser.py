@@ -43,12 +43,29 @@ _DRAW_MODE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 
+# Matches explicit legacy standard effect cues
+_EXPLICIT_STANDARD = re.compile(
+    r"^\s*(?:Image\s+\d+\s+FX\b|(?:HOLD|ZOOM|PAN|CAMERA|EFFECT)\s+\d+(?:\.\d+)?s\s*(?:-|–|—))",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# Matches draw directives
+_DRAW_DIRECTIVE = re.compile(
+    r"^\s*(?:DRAW|COMPLETE_BEFORE_END|POST_MOTION|OBJECT_EFFECT|CAMERA_AFTER|STYLE)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+
 # Matches the optional "Image N FX" header line inside standard effect cue text.
 _IMG_HDR = re.compile(r"^\s*Image\s+\d+\s+FX\b", re.IGNORECASE)
 
 
 def _is_draw_cue(text: str) -> bool:
-    return bool(_DRAW_MODE.search(text))
+    if _DRAW_MODE.search(text) or _DRAW_DIRECTIVE.search(text):
+        return True
+    if not _EXPLICIT_STANDARD.search(text):
+        return True
+    return False
+
 
 
 @dataclass(frozen=True)

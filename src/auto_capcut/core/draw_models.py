@@ -155,6 +155,8 @@ class DrawImagePlan:
     actions: tuple[DrawAction, ...]
     object_effects: tuple["ObjectEffectOverride", ...] = ()
     camera_after: tuple[CameraAfterDirective, ...] = ()
+    complete_before_end_us: int | None = None
+    post_motion: str | None = None
 
     @property
     def duration_us(self) -> int:
@@ -162,7 +164,8 @@ class DrawImagePlan:
 
     @property
     def draw_action(self) -> DrawAction:
-        return next(action for action in self.actions if action.type is DrawActionType.DRAW)
+        return next((action for action in self.actions if action.type is DrawActionType.DRAW), DrawAction(DrawActionType.DRAW, 0, self.duration_us, {"direction": "auto", "unmatched": "last"}, ""))
+
 
 
 @dataclass(frozen=True)
@@ -204,11 +207,11 @@ class SceneObject:
     type: str
     box: NormalizedRect
     camera_frame: NormalizedRect | None = None
-    render_effect: str = DrawObjectEffect.DRAW.value
-    direction: str = DrawObjectDirection.AUTO.value
+    render_effect: str = "draw"
+    direction: str = "auto"
     duration_us: int | None = None
     pause_after_us: int | None = None
-    behavior_fields_present: frozenset[str] = frozenset()
+    behavior_fields_present: frozenset[str] = field(default_factory=frozenset)
 
 
 @dataclass(frozen=True)
@@ -216,8 +219,8 @@ class SceneImage:
     filename: str
     source_size: tuple[int, int]
     objects: tuple[SceneObject, ...]
-    draw_order: tuple[str, ...]
-    source_sha256: str | None = None
+    draw_order: tuple[str, ...] = ()
+    source_sha256: str = ""
 
     @property
     def object_map(self) -> dict[str, SceneObject]:
@@ -243,6 +246,7 @@ class DrawProjectConfig:
     fallback_basic: bool = True
     advanced_diagnostics: bool = False
     reuse_cache: bool = True
+    post_motion: str = "random_light"
 
 
 

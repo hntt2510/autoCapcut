@@ -21,8 +21,8 @@ from auto_capcut.core.errors import DrawParseError
 from auto_capcut.core.srt_parser import parse_srt
 
 _HEADER = re.compile(r"^([A-Za-z][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$")
-_SPACE_HEADER = re.compile(r"^(MODE|STYLE|OBJECTS)\s+(.+?)\s*$", re.IGNORECASE)
-_BLOCK_HEADER = re.compile(r"^Image\s+(\d+)\s+DRAW$", re.IGNORECASE)
+_SPACE_HEADER = re.compile(r"^(MODE|STYLE|OBJECTS|COMPLETE_BEFORE_END|POST_MOTION)\s+(.+?)\s*$", re.IGNORECASE)
+_BLOCK_HEADER = re.compile(r"^Image\s+(\d+)\s+(?:DRAW|FX)$", re.IGNORECASE)
 _OBJECT_EFFECT = re.compile(r"^OBJECT_EFFECT\s*:?\s*(.*)$", re.IGNORECASE)
 _CAMERA_AFTER = re.compile(r"^CAMERA_AFTER\s*:?\s*(.*)$", re.IGNORECASE)
 _ACTION = re.compile(
@@ -34,13 +34,17 @@ _KNOWN = {item.value for item in DrawActionType}
 
 
 def _seconds(value: str, label: str) -> int:
+    val = value.strip()
+    if val.casefold().endswith("s"):
+        val = val[:-1].strip()
     try:
-        result = float(value)
+        result = float(val)
     except ValueError as exc:
         raise DrawParseError(f"{label} must be a number of seconds") from exc
     if result < 0:
         raise DrawParseError(f"{label} cannot be negative")
     return round(result * 1_000_000)
+
 
 
 def _properties(text: str, image_index: int, action_name: str) -> dict[str, str]:
@@ -267,15 +271,17 @@ def parse_draw_effect(path: str | Path) -> DrawEffectFile:
                 camera_after.append(directive)
             else:
                 actions.append(_parse_action(line, image_index))
-        unknown_headers = sorted(set(headers) - {"image", "mode", "style", "objects"})
+        unknown_headers = sorted(set(headers) - {"image", "mode", "style", "objects", "complete_before_end", "post_motion"})
         if unknown_headers:
             raise DrawParseError(f"Image {image_index}: unsupported header(s): {', '.join(unknown_headers)}")
-        if headers.get("mode", "").casefold() not in {item.value for item in DrawMode}:
+        mode_str = headers.get("mode", "basic_draw").casefold()
+        if mode_str not in {item.value for item in DrawMode}:
             raise DrawParseError(f"Image {image_index}: MODE must be basic_draw or advanced_draw")
-        if headers.get("style", "").casefold() not in {item.value for item in DrawStyle}:
+        style_str = headers.get("style", "v1").casefold()
+        if style_str not in {item.value for item in DrawStyle}:
             raise DrawParseError(f"Image {image_index}: STYLE must be v1 or v2")
-        mode = DrawMode(headers["mode"].casefold())
-        style = DrawStyle(headers["style"].casefold())
+        mode = DrawMode(mode_str)
+        style = DrawStyle(style_str)
         objects = headers.get("objects", "manual" if mode is DrawMode.ADVANCED else "auto").casefold()
         if objects not in {"manual", "auto"}:
             raise DrawParseError(f"Image {image_index}: OBJECTS must be manual or auto")
@@ -284,13 +290,34 @@ def parse_draw_effect(path: str | Path) -> DrawEffectFile:
             raise DrawParseError(f"Image {image_index}: {mode.value} requires OBJECTS={expected_objects}")
         if "image" in headers and not headers["image"]:
             raise DrawParseError(f"Image {image_index}: IMAGE cannot be empty")
-        if len([action for action in actions if action.type is DrawActionType.DRAW]) != 1:
+
+        complete_before_end_us = None
+        if "complete_before_end" in headers:
+            complete_before_end_us = _seconds(headers["complete_before_end"], f"Image {image_index} COMPLETE_BEFORE_END")
+            if complete_before_end_us <= 0 or complete_before_end_us >= cue.duration_us:
+                raise DrawParseError(f"Image {image_index}: COMPLETE_BEFORE_END must be positive and less than cue duration")
+
+        post_motion = None
+        if "post_motion" in headers:
+            pm = headers["post_motion"].casefold()
+            valid_post = {"none", "random_light", "subtle_zoom_in", "subtle_zoom_out", "subtle_pan_left", "subtle_pan_right"}
+            if pm not in valid_post:
+                raise DrawParseError(f"Image {image_index}: POST_MOTION must be one of {', '.join(sorted(valid_post))}")
+            post_motion = pm
+
+        draw_actions = [action for action in actions if action.type is DrawActionType.DRAW]
+        if len(draw_actions) == 0:
+            if mode is DrawMode.ADVANCED and actions:
+                raise DrawParseError(f"Image {image_index}: exactly one DRAW action is required")
+            actions.insert(0, DrawAction(DrawActionType.DRAW, 0, cue.duration_us, {"direction": "auto", "unmatched": "last"}, ""))
+        elif len(draw_actions) > 1:
             raise DrawParseError(f"Image {image_index}: exactly one DRAW action is required")
+
         draw = next(action for action in actions if action.type is DrawActionType.DRAW)
         if draw.start_us != 0:
             raise DrawParseError(f"Image {image_index}: DRAW must begin at 0.00s")
-        if not actions or max(action.end_us for action in actions) != cue.duration_us:
-            raise DrawParseError(f"Image {image_index}: final action must end at the SRT cue duration")
+        if any(action.end_us > cue.duration_us for action in actions):
+            raise DrawParseError(f"Image {image_index}: actions cannot exceed SRT cue duration")
         camera = [action for action in actions if action.type is not DrawActionType.DRAW]
         for left_index, left in enumerate(camera):
             for right in camera[left_index + 1 :]:
@@ -300,8 +327,9 @@ def parse_draw_effect(path: str | Path) -> DrawEffectFile:
             raise DrawParseError(f"Image {image_index}: OBJECT_EFFECT directives require advanced_draw")
         if camera_after and mode is not DrawMode.ADVANCED:
             raise DrawParseError(f"Image {image_index}: CAMERA_AFTER directives require advanced_draw")
-        plans.append(DrawImagePlan(image_index, headers.get("image"), cue.start_us, cue.end_us, mode, style, objects, tuple(actions), tuple(object_effects), tuple(camera_after)))
+        plans.append(DrawImagePlan(image_index, headers.get("image"), cue.start_us, cue.end_us, mode, style, objects, tuple(actions), tuple(object_effects), tuple(camera_after), complete_before_end_us, post_motion))
     return DrawEffectFile(source, tuple(plans), tuple(warnings))
+
 
 
 # Naming parallel to the existing Effect Direction parser for callers that
