@@ -1442,8 +1442,90 @@ def _ffmpeg_exe() -> str:
     raise DrawRenderError("FFmpeg is unavailable. Install the bundled renderer dependencies or put ffmpeg on PATH.")
 
 
+def _clip_signature(
+    image_hash: str,
+    plan: DrawImagePlan,
+    scene: SceneImage | None,
+    resolution: tuple[int, int],
+    fps: int,
+    remove_background: bool,
+) -> str:
+    plan_dict = {
+        "mode": plan.mode.value,
+        "style": plan.style.value,
+        "duration_us": plan.duration_us,
+        "actions": [
+            {
+                "type": a.type.value,
+                "start_us": a.start_us,
+                "end_us": a.end_us,
+                "params": a.params,
+            }
+            for a in plan.actions
+        ],
+        "object_effects": [
+            {
+                "target": o.target,
+                "effect": o.effect,
+                "direction": o.direction,
+                "duration_us": o.duration_us,
+                "pause_after_us": o.pause_after_us,
+                "duration_mode": o.duration_mode,
+            }
+            for o in plan.object_effects
+        ],
+        "camera_after": [
+            {
+                "object_id": c.object_id,
+                "action": c.action,
+                "target": c.target,
+                "duration_us": c.duration_us,
+                "duration_mode": c.duration_mode,
+                "hold_us": c.hold_us,
+                "framing": c.framing,
+                "easing": c.easing,
+                "return_duration_us": c.return_duration_us,
+                "return_duration_mode": c.return_duration_mode,
+                "persist": c.persist,
+            }
+            for c in plan.camera_after
+        ],
+    }
+    scene_dict = None
+    if scene is not None:
+        scene_dict = {
+            "source_size": scene.source_size,
+            "objects": [
+                {
+                    "id": obj.id,
+                    "type": obj.type,
+                    "box": {"x": obj.box.x, "y": obj.box.y, "w": obj.box.w, "h": obj.box.h},
+                    "camera_frame": {"x": obj.camera_frame.x, "y": obj.camera_frame.y, "w": obj.camera_frame.w, "h": obj.camera_frame.h} if obj.camera_frame else None,
+                    "render_effect": obj.render_effect,
+                    "direction": obj.direction,
+                    "duration_us": obj.duration_us,
+                    "pause_after_us": obj.pause_after_us,
+                }
+                for obj in scene.objects
+            ],
+            "draw_order": list(scene.draw_order),
+        }
+    return _hash_signature(
+        ALGORITHM_VERSION,
+        OBJECT_EFFECT_PREPROCESS_VERSION,
+        image_hash,
+        json.dumps(plan_dict, sort_keys=True),
+        json.dumps(scene_dict, sort_keys=True) if scene_dict else "",
+        resolution[0],
+        resolution[1],
+        fps,
+        remove_background,
+    )
+
+
 class DrawRenderer:
     def __init__(self, cache_root: Path, hand_asset: Path | None = None) -> None:
+
         self.cache_root = cache_root
         asset_root = Path(__file__).resolve().parents[1] / "assets"
         if not (asset_root / "draw_hand.png").is_file() and getattr(sys, "_MEIPASS", None):
@@ -2006,6 +2088,19 @@ class DrawRenderer:
         cache_root.mkdir(parents=True, exist_ok=True)
         text_mode = TextMode(plan.draw_action.params.get("text", TextMode.KEEP.value).casefold())
         artifact = prepare_image(image_path, cache_root, plan.style, text_mode, config.remove_background, scene)
+
+        # Check rendered clip cache
+        clip_sig = _clip_signature(artifact.source_hash, plan, scene, config.resolution, config.fps, config.remove_background)
+        cached_clip = cache_root / "rendered_clips" / f"{clip_sig}.mp4"
+        if config.reuse_cache and cached_clip.is_file() and cached_clip.stat().st_size > 0:
+            LOGGER.info("Reusing cached draw render for %s (signature %s)", image_path.name, clip_sig[:12])
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            if output_path.resolve() != cached_clip.resolve():
+                shutil.copyfile(cached_clip, output_path)
+            if progress:
+                progress(100, f"Reused cached {output_path.name}")
+            return output_path
+
         if progress:
             progress(20, f"Prepared {image_path.name}")
         text_mode = TextMode(plan.draw_action.params.get("text", TextMode.KEEP.value).casefold())
@@ -2060,6 +2155,12 @@ class DrawRenderer:
             if return_code != 0:
                 raise DrawRenderError(f"FFmpeg failed for {image_path.name}: {stderr.strip() or return_code}")
             temporary.replace(output_path)
+            try:
+                cached_clip.parent.mkdir(parents=True, exist_ok=True)
+                if output_path.resolve() != cached_clip.resolve():
+                    shutil.copyfile(output_path, cached_clip)
+            except OSError:
+                pass
         except BrokenPipeError as exc:
             stderr = process.stderr.read().decode("utf-8", "replace") if process.stderr else ""
             process.wait()
@@ -2075,6 +2176,7 @@ class DrawRenderer:
         if progress:
             progress(100, f"Wrote {output_path.name}")
         return output_path
+
 
 
 class DrawRenderService:

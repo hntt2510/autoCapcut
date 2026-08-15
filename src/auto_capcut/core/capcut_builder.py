@@ -149,6 +149,12 @@ class CapCutBuilder:
                     self._maybe_add_transition(segment, None, timing, timings[index + 1], job, warnings, index)
                 script.add_segment(segment, "Images")
                 continue
+
+            # If this cue was classified as a DRAW cue in the unified SRT, failure to
+            # have a rendered draw clip must NEVER silently fall back to a static image.
+            if effects is not None and effects[index] is None:
+                raise ValidationError(f"Image {index + 1}: DRAW cue failed to produce a valid rendered draw clip.")
+
             # ── Standard image path ────────────────────────────────────────
             material = cc.VideoMaterial(str(image_path))
             base_scale = engine.capcut_cover_scale(job.config.resolution.width, job.config.resolution.height, material.width, material.height)
@@ -192,21 +198,18 @@ class CapCutBuilder:
 
     def _render_draw_clips(self, job: ProjectJob, timings: list[ImageTiming], progress, warnings: list[str]) -> dict[int, Path]:
         """Pre-render draw clips for all draw cues and return a map of index -> MP4 path."""
-        from auto_capcut.core.unified_effect_parser import parse_unified_effect, UnifiedEffectFile
+        from auto_capcut.core.unified_effect_parser import parse_unified_effect
         from auto_capcut.core.draw_models import DrawProjectConfig
         from auto_capcut.core.draw_renderer import DrawRenderService
+        import logging
+        logger = logging.getLogger(__name__)
 
         # Determine which SRT to parse for draw cues
         draw_srt = job.config.draw_effect_srt or job.config.effect_direction_srt
         if draw_srt is None or not draw_srt.is_file():
             return {}
 
-        try:
-            unified = parse_unified_effect(draw_srt)
-        except Exception as exc:
-            warnings.append(f"Draw effect SRT parse error: {exc}")
-            return {}
-
+        unified = parse_unified_effect(draw_srt)
         if not unified.has_draw_cues:
             return {}
 
@@ -244,12 +247,13 @@ class CapCutBuilder:
             image_folder=job.images[0].parent if job.images else Path("."),
             effect_file=draw_srt,
             output_folder=draw_output_folder,
-            scene_file=job.draw_scene_json or job.config.draw_scene_json,
+            scene_file=job.config.draw_scene_json,
             resolution=resolution,
             fps=30,
             remove_background=job.config.draw_remove_background,
             fallback_basic=job.config.draw_fallback_basic,
             advanced_diagnostics=job.config.draw_diagnostics,
+            reuse_cache=job.config.draw_reuse_cache,
         )
 
         progress(20, f"Rendering {len(draw_indexes)} draw clip(s)...")
@@ -258,20 +262,42 @@ class CapCutBuilder:
             progress(20 + round(value * 0.15), message)
 
         service = DrawRenderService()
-        try:
-            rendered = service.render_subset(
-                draw_config,
-                aligned_plans,
-                list(job.images),
-                draw_indexes,
-                progress=draw_progress,
+        rendered = service.render_subset(
+            draw_config,
+            aligned_plans,
+            list(job.images),
+            draw_indexes,
+            progress=draw_progress,
+        )
+
+        # Validate that all requested draw cues produced valid MP4s with correct duration
+        DURATION_TOLERANCE_US = 70_000  # ~2 frames at 30fps tolerance for frame rounding
+        for img_idx in draw_indexes:
+            clip_path = rendered.get(img_idx)
+            if clip_path is None or not clip_path.is_file() or clip_path.stat().st_size == 0:
+                raise ValidationError(f"Failed to produce draw clip for Image {img_idx + 1}: output file is missing or empty")
+
+            actual_duration_us = probe_duration_us(clip_path)
+            expected_duration_us = timings[img_idx].duration_us
+            diff_us = abs(actual_duration_us - expected_duration_us)
+            logger.info(
+                "Image %03d draw clip duration validation: expected=%dus, actual=%dus, diff=%dus",
+                img_idx + 1,
+                expected_duration_us,
+                actual_duration_us,
+                diff_us,
             )
-        except Exception as exc:
-            warnings.append(f"Draw rendering failed: {exc}")
-            return {}
+            if diff_us > DURATION_TOLERANCE_US:
+                raise ValidationError(
+                    f"Draw clip {clip_path.name} (Image {img_idx + 1}) duration mismatch: "
+                    f"expected {expected_duration_us / 1_000_000:.3f}s, "
+                    f"actual {actual_duration_us / 1_000_000:.3f}s "
+                    f"(difference {diff_us / 1_000_000:.3f}s exceeds tolerance)"
+                )
 
         progress(35, "Draw clips ready.")
         return rendered
+
 
 
 
@@ -337,7 +363,10 @@ class CapCutBuilder:
         if not effects:
             return resolved, keys
         for cue_index, (cue, timing) in enumerate(zip(effects, timings)):
+            if cue is None:
+                continue
             for effect_index, effect in enumerate(cue.effects):
+
                 preset_name = effect.params.get("preset", "").strip()
                 if not preset_name:
                     continue

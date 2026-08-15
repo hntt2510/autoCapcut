@@ -101,7 +101,8 @@ def test_render_draw_clips_calls_render_subset_for_draw_cues(tmp_path: Path) -> 
     fake_mp4 = tmp_path / "002_draw.mp4"
     fake_mp4.write_bytes(b"mp4")
 
-    with patch("auto_capcut.core.draw_renderer.DrawRenderService") as mock_service_cls:
+    with patch("auto_capcut.core.draw_renderer.DrawRenderService") as mock_service_cls, \
+         patch("auto_capcut.core.capcut_builder.probe_duration_us", return_value=5_000_000):
         mock_service = MagicMock()
         mock_service.render_subset.return_value = {1: fake_mp4}
         mock_service_cls.return_value = mock_service
@@ -139,41 +140,15 @@ def test_render_draw_clips_skips_when_no_draw_cues(tmp_path: Path) -> None:
     assert not mock_service.render_subset.called
 
 
-def test_render_draw_clips_returns_empty_when_disabled(tmp_path: Path) -> None:
-    """draw_enabled=False means _render_draw_clips is never called at all.
-    We verify the flag is checked by calling the private method directly
-    with a draw SRT — the unified parser should still classify the cue as draw
-    but render_subset should not be called if we simulate the disabled path."""
-    # When draw_enabled is False, build_job just skips _render_draw_clips entirely.
-    # Here we simply verify _render_draw_clips returns {} for a missing SRT.
-    job = _job(tmp_path, draw_enabled=False, draw_srt=None)
-    job_disabled = ProjectJob(
-        name="test",
-        images=job.images,
-        audio_path=job.audio_path,
-        subtitle_srt=None,
-        image_timing_srt=None,
-        config=ProjectConfig(
-            project_name="test",
-            image_folders=[tmp_path],
-            audio_path=tmp_path / "audio.mp3",
-            draft_folder=tmp_path,
-            draw_enabled=False,
-        ),
-    )
-    builder = CapCutBuilder.__new__(CapCutBuilder)
-    builder.cc = MagicMock()
-    builder.effect_templates = MagicMock()
-    warnings: list[str] = []
-    result = builder._render_draw_clips(job_disabled, _timings(2), lambda *a: None, warnings)
-    # No SRT configured → must return {} cleanly
-    assert result == {}
+def test_draw_parse_failure_raises_validation_error(tmp_path: Path) -> None:
+    """Requirement 1: Malformed draw cues in the SRT MUST raise ValidationError and block the build."""
+    from auto_capcut.core.errors import ValidationError
 
-
-def test_render_draw_clips_gracefully_handles_parse_error(tmp_path: Path) -> None:
-    """A malformed SRT should append to warnings and return {} rather than raise."""
     bad_srt = tmp_path / "bad.srt"
-    bad_srt.write_text("this is not a valid SRT\n", encoding="utf-8")
+    bad_srt.write_text(
+        "1\n00:00:00,000 --> 00:00:05,000\nMODE=basic_draw\nSTYLE=invalid_style\nDRAW 0s-5s:\n",
+        encoding="utf-8",
+    )
     config = ProjectConfig(
         project_name="test",
         image_folders=[tmp_path],
@@ -196,8 +171,95 @@ def test_render_draw_clips_gracefully_handles_parse_error(tmp_path: Path) -> Non
     builder.cc = MagicMock()
     builder.effect_templates = MagicMock()
     warnings: list[str] = []
-    result = builder._render_draw_clips(job, _timings(1), lambda *a: None, warnings)
-    assert result == {}
+    with pytest.raises(ValidationError):
+        builder._render_draw_clips(job, _timings(1), lambda *a: None, warnings)
+
+
+def test_draw_render_failure_raises_validation_error(tmp_path: Path) -> None:
+    """Requirement 1: Draw renderer failure must raise DrawRenderError/ValidationError and never fallback."""
+    from auto_capcut.core.errors import DrawRenderError
+
+    srt = _mixed_srt(tmp_path / "effect.srt")
+    job = _job(tmp_path, draw_enabled=True, draw_srt=srt)
+    timings = _timings(3)
+
+    with patch("auto_capcut.core.draw_renderer.DrawRenderService") as mock_service_cls:
+        mock_service = MagicMock()
+        mock_service.render_subset.side_effect = DrawRenderError("FFmpeg failed")
+        mock_service_cls.return_value = mock_service
+
+        builder = CapCutBuilder.__new__(CapCutBuilder)
+        builder.cc = MagicMock()
+        builder.effect_templates = MagicMock()
+        warnings: list[str] = []
+        with pytest.raises(DrawRenderError, match="FFmpeg failed"):
+            builder._render_draw_clips(job, timings, lambda *a: None, warnings)
+
+
+def test_draw_duration_mismatch_blocks_build(tmp_path: Path) -> None:
+    """Requirement 3: Rendered draw clip duration mismatch exceeding tolerance MUST raise ValidationError."""
+    from auto_capcut.core.errors import ValidationError
+
+    srt = _mixed_srt(tmp_path / "effect.srt")
+    job = _job(tmp_path, draw_enabled=True, draw_srt=srt)
+    timings = _timings(3)  # each 5,000,000 us
+
+    fake_mp4 = tmp_path / "002_draw.mp4"
+    fake_mp4.write_bytes(b"mp4")
+
+    # Mock probed duration to 3.0s instead of expected 5.0s (2s mismatch > 70ms tolerance)
+    with patch("auto_capcut.core.draw_renderer.DrawRenderService") as mock_service_cls, \
+         patch("auto_capcut.core.capcut_builder.probe_duration_us", return_value=3_000_000):
+        mock_service = MagicMock()
+        mock_service.render_subset.return_value = {1: fake_mp4}
+        mock_service_cls.return_value = mock_service
+
+        builder = CapCutBuilder.__new__(CapCutBuilder)
+        builder.cc = MagicMock()
+        builder.effect_templates = MagicMock()
+        warnings: list[str] = []
+        with pytest.raises(ValidationError, match="duration mismatch"):
+            builder._render_draw_clips(job, timings, lambda *a: None, warnings)
+
+
+def test_missing_draw_clip_raises_in_add_images(tmp_path: Path) -> None:
+    """Requirement 1: If a cue was a draw cue, missing draw clip MUST raise ValidationError in _add_images."""
+    from auto_capcut.core.errors import ValidationError
+    from auto_capcut.models import EffectCue, VisualEffect
+
+    builder = CapCutBuilder.__new__(CapCutBuilder)
+    cc = MagicMock()
+    mock_mat = MagicMock()
+    mock_mat.width = 1920
+    mock_mat.height = 1080
+    cc.VideoMaterial.return_value = mock_mat
+    builder.cc = cc
+    builder.effect_templates = MagicMock()
+
+    images = (tmp_path / "img1.png", tmp_path / "img2.png")
+    for img in images:
+        img.write_bytes(b"img")
+
+    config = ProjectConfig(
+        project_name="test",
+        image_folders=[tmp_path],
+        audio_path=tmp_path / "audio.mp3",
+        draft_folder=tmp_path,
+        motion_enabled=True,
+        motion_mode="Effect Direction SRT",
+        effect_direction_srt=tmp_path / "effect.srt",
+    )
+    job = ProjectJob("test", images, tmp_path / "audio.mp3", None, None, config)
+    timings = _timings(2)
+
+    script = MagicMock()
+    cue1 = EffectCue(1, 0, 5_000_000, "", (VisualEffect("HOLD", 0, 5_000_000),))
+    # cue 2 is None (Draw cue in unified effect list), but draw_clips is empty!
+    effects = [cue1, None]
+    warnings: list[str] = []
+
+    with pytest.raises(ValidationError, match="DRAW cue failed to produce a valid rendered draw clip"):
+        builder._add_images(script, job, timings, warnings, effects, frozenset(), draw_clips={})
 
 
 def test_unified_flow_single_effect_srt_routes_mixed_cues(tmp_path: Path) -> None:
@@ -242,7 +304,8 @@ def test_unified_flow_single_effect_srt_routes_mixed_cues(tmp_path: Path) -> Non
     # 2. _render_draw_clips automatically uses effect_direction_srt
     fake_mp4 = tmp_path / "002_draw.mp4"
     fake_mp4.write_bytes(b"mp4")
-    with patch("auto_capcut.core.draw_renderer.DrawRenderService") as mock_service_cls:
+    with patch("auto_capcut.core.draw_renderer.DrawRenderService") as mock_service_cls, \
+         patch("auto_capcut.core.capcut_builder.probe_duration_us", return_value=5_000_000):
         mock_service = MagicMock()
         mock_service.render_subset.return_value = {1: fake_mp4}
         mock_service_cls.return_value = mock_service
@@ -254,6 +317,7 @@ def test_unified_flow_single_effect_srt_routes_mixed_cues(tmp_path: Path) -> Non
         draw_clips = builder._render_draw_clips(job, timings, lambda *a: None, warnings)
 
     assert draw_clips == {1: fake_mp4}
+
 
 
 def test_add_images_substitutes_draw_mp4_and_applies_motion_to_standard_images(tmp_path: Path) -> None:

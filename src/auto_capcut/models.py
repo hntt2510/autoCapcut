@@ -309,8 +309,7 @@ class ProjectJob:
     subtitle_srt: Optional[Path]
     image_timing_srt: Optional[Path]
     config: ProjectConfig
-    draw_effect_file: Optional[Path] = None   # resolved path to the draw/unified SRT
-    draw_scene_json: Optional[Path] = None
+
 
 
 @dataclass(frozen=True)

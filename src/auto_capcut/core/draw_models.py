@@ -242,6 +242,8 @@ class DrawProjectConfig:
     remove_background: bool = False
     fallback_basic: bool = True
     advanced_diagnostics: bool = False
+    reuse_cache: bool = True
+
 
 
 ProgressCallback = Callable[[int, str], None]

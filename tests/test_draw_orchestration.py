@@ -113,3 +113,92 @@ def test_scene_json_version_key_compat(tmp_path: Path) -> None:
     doc = load_scene(scene_json)
     assert doc.schema_version == 1
 
+
+def test_draw_renderer_cache_reuse_and_invalidation(tmp_path: Path) -> None:
+    """Requirement 4: draw_reuse_cache=True reuses rendered clip on identical signature,
+    while draw_reuse_cache=False or changed parameters forces fresh render."""
+    from unittest.mock import MagicMock, patch
+    from PIL import Image as PILImage
+    from auto_capcut.core.draw_renderer import DrawRenderer
+
+    # Create dummy PNG
+    img_path = tmp_path / "test.png"
+    PILImage.new("RGB", (64, 64), color="white").save(img_path)
+
+    effect = parse_draw_effect(effect_file(tmp_path / "effect.srt"))
+    plan = effect.images[1]  # basic_draw
+
+    cache_dir = tmp_path / "cache"
+    out_dir = tmp_path / "out"
+    renderer = DrawRenderer(cache_dir)
+
+    # 1. First render with reuse_cache=True (cache miss -> calls FFmpeg)
+    config = DrawProjectConfig(tmp_path, tmp_path / "effect.srt", out_dir, reuse_cache=True)
+    out1 = out_dir / "001_draw.mp4"
+
+    with patch("subprocess.Popen") as mock_popen, \
+         patch("auto_capcut.core.draw_renderer.prepare_image") as mock_prep:
+        mock_proc = MagicMock()
+        mock_proc.stdin = MagicMock()
+        mock_proc.stderr = MagicMock()
+        mock_proc.stderr.read.return_value = b""
+        mock_proc.wait.return_value = 0
+        mock_popen.return_value = mock_proc
+
+        # Create dummy partial output so replace succeeds
+        def fake_write(*args, **kwargs):
+            partial = out1.with_name(f"{out1.stem}.partial{out1.suffix}")
+            partial.write_bytes(b"rendered_video")
+        mock_proc.stdin.close.side_effect = fake_write
+
+        mock_art = MagicMock()
+        mock_art.source_hash = "fakehash123"
+        mock_art.strokes = []
+        mock_prep.return_value = mock_art
+
+        with patch.object(renderer, "_frame", return_value=PILImage.new("RGB", (1920, 1080))):
+            renderer.render(img_path, plan, config, out1)
+        assert mock_popen.call_count == 1
+
+    # 2. Second render with reuse_cache=True on identical inputs (cache hit -> NO FFmpeg call)
+    out2 = out_dir / "002_draw.mp4"
+    with patch("subprocess.Popen") as mock_popen, \
+         patch("auto_capcut.core.draw_renderer.prepare_image") as mock_prep:
+        mock_art = MagicMock()
+        mock_art.source_hash = "fakehash123"
+        mock_art.strokes = []
+        mock_prep.return_value = mock_art
+
+        renderer.render(img_path, plan, config, out2)
+        assert mock_popen.call_count == 0  # Reused from cache!
+        assert out2.is_file()
+        assert out2.read_bytes() == b"rendered_video"
+
+    # 3. Third render with reuse_cache=False (force fresh render -> calls FFmpeg)
+    config_no_cache = DrawProjectConfig(tmp_path, tmp_path / "effect.srt", out_dir, reuse_cache=False)
+    out3 = out_dir / "003_draw.mp4"
+    with patch("subprocess.Popen") as mock_popen, \
+         patch("auto_capcut.core.draw_renderer.prepare_image") as mock_prep:
+        mock_proc = MagicMock()
+        mock_proc.stdin = MagicMock()
+        mock_proc.stderr = MagicMock()
+        mock_proc.stderr.read.return_value = b""
+        mock_proc.wait.return_value = 0
+        mock_popen.return_value = mock_proc
+
+        def fake_write3(*args, **kwargs):
+            partial = out3.with_name(f"{out3.stem}.partial{out3.suffix}")
+            partial.write_bytes(b"fresh_video")
+        mock_proc.stdin.close.side_effect = fake_write3
+
+        mock_art = MagicMock()
+        mock_art.source_hash = "fakehash123"
+        mock_art.strokes = []
+        mock_prep.return_value = mock_art
+
+        with patch.object(renderer, "_frame", return_value=PILImage.new("RGB", (1920, 1080))):
+            renderer.render(img_path, plan, config_no_cache, out3)
+        assert mock_popen.call_count == 1
+        assert out3.read_bytes() == b"fresh_video"
+
+
