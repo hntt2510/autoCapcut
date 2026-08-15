@@ -137,6 +137,7 @@ def test_draw_renderer_cache_reuse_and_invalidation(tmp_path: Path) -> None:
     out1 = out_dir / "001_draw.mp4"
 
     with patch("subprocess.Popen") as mock_popen, \
+         patch("auto_capcut.core.draw_renderer._ffmpeg_exe", return_value="ffmpeg"), \
          patch("auto_capcut.core.draw_renderer.prepare_image") as mock_prep:
         mock_proc = MagicMock()
         mock_proc.stdin = MagicMock()
@@ -160,6 +161,7 @@ def test_draw_renderer_cache_reuse_and_invalidation(tmp_path: Path) -> None:
             renderer.render(img_path, plan, config, out1)
         assert mock_popen.call_count == 1
 
+
     # 2. Second render with reuse_cache=True on identical inputs (cache hit -> NO FFmpeg call)
     out2 = out_dir / "002_draw.mp4"
     with patch("subprocess.Popen") as mock_popen, \
@@ -178,7 +180,9 @@ def test_draw_renderer_cache_reuse_and_invalidation(tmp_path: Path) -> None:
     config_no_cache = DrawProjectConfig(tmp_path, tmp_path / "effect.srt", out_dir, reuse_cache=False)
     out3 = out_dir / "003_draw.mp4"
     with patch("subprocess.Popen") as mock_popen, \
+         patch("auto_capcut.core.draw_renderer._ffmpeg_exe", return_value="ffmpeg"), \
          patch("auto_capcut.core.draw_renderer.prepare_image") as mock_prep:
+
         mock_proc = MagicMock()
         mock_proc.stdin = MagicMock()
         mock_proc.stderr = MagicMock()
@@ -200,5 +204,47 @@ def test_draw_renderer_cache_reuse_and_invalidation(tmp_path: Path) -> None:
             renderer.render(img_path, plan, config_no_cache, out3)
         assert mock_popen.call_count == 1
         assert out3.read_bytes() == b"fresh_video"
+
+
+def test_validate_targets_blocks_unknown_draw_object(tmp_path: Path) -> None:
+    """Requirement 8: Explicit OBJECT_EFFECT or CAMERA_AFTER targeting unknown object must BLOCK with clear error."""
+    from auto_capcut.core.draw_models import NormalizedRect, SceneImage, SceneObject
+    from auto_capcut.core.draw_renderer import DrawRenderer
+
+    img_path = tmp_path / "img.png"
+    img_path.write_bytes(b"png")
+
+    srt = tmp_path / "effect.srt"
+    srt.write_text(
+        "\n".join([
+            "1",
+            "00:00:00,000 --> 00:00:05,000",
+            "MODE advanced_draw",
+            "STYLE v1",
+            "OBJECT_EFFECT target=object_6 effect=draw",
+            "DRAW 0s-5s:",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+    effect = parse_draw_effect(srt)
+    plan = effect.images[0]
+
+    # Scene only contains object_1 .. object_5
+    objects = [
+        SceneObject(id=f"object_{i}", type="art", box=NormalizedRect(0.1 * i, 0.1, 0.08, 0.08))
+        for i in range(1, 6)
+    ]
+    scene = SceneImage((1920, 1080), "hash", objects, [f"object_{i}" for i in range(1, 6)])
+
+    renderer = DrawRenderer(tmp_path / "cache")
+    config = DrawProjectConfig(tmp_path, srt, tmp_path / "out")
+
+    with pytest.raises(
+        DrawRenderError,
+        match=r'Image 001: unknown draw object "object_6"\. Available objects: object_1, object_2, object_3, object_4, object_5',
+    ):
+        renderer.render(img_path, plan, config, tmp_path / "out" / "001_draw.mp4", scene)
+
 
 

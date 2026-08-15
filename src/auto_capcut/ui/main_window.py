@@ -125,18 +125,27 @@ class MainWindow(QMainWindow):
         self.draw_enabled.setChecked(True)
         draw_form.addRow(self.draw_enabled)
 
+        self.draw_source_label = QLabel("Uses main Effect Direction SRT")
+        self.draw_source_label.setStyleSheet("color: #666; font-style: italic;")
+        draw_form.addRow("Effect source:", self.draw_source_label)
 
+        # Internal / backwards-compat holder (empty by default)
         self.draw_effect_path = QLineEdit()
-        draw_effect_browse = QPushButton("Browse")
-        draw_effect_browse.clicked.connect(lambda: self._browse_file(self.draw_effect_path, "SRT files (*.srt)"))
-        draw_effect_row = QHBoxLayout(); draw_effect_row.addWidget(self.draw_effect_path); draw_effect_row.addWidget(draw_effect_browse)
-        draw_form.addRow("Draw Effect SRT (optional)", draw_effect_row)
 
         self.draw_scene_path = QLineEdit()
         draw_scene_browse = QPushButton("Browse")
         draw_scene_browse.clicked.connect(lambda: self._browse_file(self.draw_scene_path, "JSON files (*.json)"))
         draw_scene_row = QHBoxLayout(); draw_scene_row.addWidget(self.draw_scene_path); draw_scene_row.addWidget(draw_scene_browse)
-        draw_form.addRow("Scene JSON (optional)", draw_scene_row)
+        draw_form.addRow("Scene JSON:", draw_scene_row)
+
+        self.edit_draw_objects_btn = QPushButton("Edit Draw Objects")
+        self.edit_draw_objects_btn.clicked.connect(self._edit_draw_objects)
+        draw_form.addRow("", self.edit_draw_objects_btn)
+
+        self.draw_scene_status = QLabel("Draw scene: not configured")
+        self.draw_scene_status.setWordWrap(True)
+        self.draw_scene_status.setStyleSheet("color: #444; padding: 2px 0;")
+        draw_form.addRow("Draw scene status:", self.draw_scene_status)
 
         self.draw_remove_bg = QCheckBox("Remove simple background")
         self.draw_fallback_basic = QCheckBox("Fallback invalid advanced scenes to basic")
@@ -153,7 +162,10 @@ class MainWindow(QMainWindow):
         transitions_index = layout.indexOf(transitions)
         layout.insertWidget(transitions_index + 1, draw_grp)
 
-        self.draw_enabled.toggled.connect(self._update_enabled)
+        self.draw_enabled.toggled.connect(lambda *_: (self._update_enabled(), self._update_draw_scene_status()))
+        self.draw_scene_path.textChanged.connect(lambda *_: self._update_draw_scene_status())
+        self.draw_fallback_basic.toggled.connect(lambda *_: self._update_draw_scene_status())
+
 
     def _add_image_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Select image folder")
@@ -175,7 +187,108 @@ class MainWindow(QMainWindow):
         except Exception: return []
 
     def _image_list_changed(self) -> None:
-        self.image_count.setText(f"Number of images: {len(self._current_images())}"); self._update_effect_status()
+        self.image_count.setText(f"Number of images: {len(self._current_images())}")
+        self._update_effect_status()
+        self._update_draw_scene_status()
+
+    def _update_draw_scene_status(self) -> None:
+        if not hasattr(self, "draw_scene_status"):
+            return
+        if not self.draw_enabled.isChecked():
+            self.draw_scene_status.setText("Draw scene: draw rendering disabled")
+            return
+
+        images = self._current_images()
+        if not images:
+            self.draw_scene_status.setText("Draw scene: add image folder first")
+            return
+
+        scene_text = self.draw_scene_path.text().strip()
+        scene_doc = None
+        if scene_text:
+            path = Path(scene_text)
+            if path.is_file():
+                try:
+                    from auto_capcut.core.draw_scene import load_scene
+                    scene_doc = load_scene(path)
+                except Exception as exc:
+                    self.draw_scene_status.setText(f"Draw scene: invalid scene JSON ({exc})")
+                    return
+
+        # Check effect SRT for which images have advanced_draw cues
+        draw_cues_by_img: dict[str, str] = {}
+        effect_text = self.effect_path.text().strip()
+        if effect_text and Path(effect_text).is_file():
+            try:
+                from auto_capcut.core.unified_effect_parser import parse_unified_effect
+                unified = parse_unified_effect(effect_text)
+                for cue in unified.cues:
+                    if cue.kind == "draw" and cue.draw_plan is not None:
+                        idx = cue.index - 1
+                        if 0 <= idx < len(images):
+                            draw_cues_by_img[images[idx].name.casefold()] = cue.draw_plan.mode.value
+            except Exception:
+                pass
+
+        configured_count = 0
+        fallback_enabled = self.draw_fallback_basic.isChecked()
+        lines: list[str] = []
+
+        for img in images:
+            key = img.name.casefold()
+            rec = None
+            if scene_doc and scene_doc.images:
+                rec = scene_doc.images.get(key)
+                if rec is None:
+                    for k, v in scene_doc.images.items():
+                        if k.casefold() == key or k == img.name:
+                            rec = v
+                            break
+
+            req_mode = draw_cues_by_img.get(key)
+            if rec:
+                configured_count += 1
+                obj_count = len(rec.objects)
+                cam_count = sum(1 for o in rec.objects if o.camera_frame is not None)
+                cam_str = f" / {cam_count} camera frame{'s' if cam_count != 1 else ''}" if cam_count else ""
+                lines.append(f"{img.name}: {obj_count} objects{cam_str}")
+            else:
+                if req_mode == "advanced_draw":
+                    if fallback_enabled:
+                        lines.append(f"{img.name}: advanced scene missing → will fallback to basic_draw")
+                    else:
+                        lines.append(f"{img.name}: advanced scene missing (blocking error)")
+                else:
+                    lines.append(f"{img.name}: not configured")
+
+        header = f"Draw scene: {len(images)} project images ({configured_count} configured)" if len(images) > 0 else "Draw scene: not configured"
+        self.draw_scene_status.setText(header + ("\n" + "\n".join(lines) if lines else ""))
+
+    def _edit_draw_objects(self) -> None:
+        images = self._current_images()
+        if not images:
+            QMessageBox.warning(self, "Draw Objects", "Add an image folder first.")
+            return
+
+        scene_text = self.draw_scene_path.text().strip()
+        if scene_text:
+            scene_path = Path(scene_text)
+        else:
+            effect_text = self.effect_path.text().strip()
+            if effect_text and Path(effect_text).is_file():
+                scene_path = Path(effect_text).parent / "draw_scene.json"
+            elif self.image_list.count() > 0:
+                scene_path = Path(self.image_list.item(0).text()) / "draw_scene.json"
+            else:
+                scene_path = images[0].parent / "draw_scene.json"
+            self.draw_scene_path.setText(str(scene_path))
+            self.settings.setValue("draw_scene_path", str(scene_path))
+
+        resolution = RESOLUTIONS[self.resolution.currentText()]
+        from auto_capcut.ui.draw_animation import DrawObjectEditorDialog
+        dialog = DrawObjectEditorDialog(images, scene_path, (resolution.width, resolution.height), parent=self)
+        dialog.exec()
+        self._update_draw_scene_status()
 
     def _update_effect_status(self) -> None:
         if self.motion_mode.currentText() != "Effect Direction SRT":
@@ -249,8 +362,9 @@ class MainWindow(QMainWindow):
         effect_mode = self.motion_enabled.isChecked() and self.motion_mode.currentText() == "Effect Direction SRT"
         self.motion_mode.setEnabled(self.motion_enabled.isChecked()); self.effect_path.setEnabled(effect_mode); self.edit_roi_button.setEnabled(effect_mode and Path(self.effect_path.text()).is_file() and bool(self._current_images())); self.motion_strength.setEnabled(self.motion_enabled.isChecked()); self.transition_type.setEnabled(self.transition_enabled.isChecked()); self.transition_duration.setEnabled(self.transition_enabled.isChecked()); self.audio_path.setPlaceholderText("Folder containing audio files" if self.folder_audio.isChecked() else "Audio file")
         draw_on = self.draw_enabled.isChecked()
-        for w in (self.draw_effect_path, self.draw_scene_path, self.draw_remove_bg, self.draw_fallback_basic, self.draw_diagnostics, self.draw_reuse_cache):
+        for w in (self.draw_source_label, self.draw_scene_path, self.edit_draw_objects_btn, self.draw_scene_status, self.draw_remove_bg, self.draw_fallback_basic, self.draw_diagnostics, self.draw_reuse_cache):
             w.setEnabled(draw_on)
+
 
     def _config(self) -> ProjectConfig:
         return ProjectConfig(
@@ -357,3 +471,5 @@ class MainWindow(QMainWindow):
         self.draw_fallback_basic.setChecked(self.settings.value("draw_fallback_basic", True, type=bool))
         self.draw_diagnostics.setChecked(self.settings.value("draw_diagnostics", False, type=bool))
         self.draw_reuse_cache.setChecked(self.settings.value("draw_reuse_cache", True, type=bool))
+        self._update_draw_scene_status()
+

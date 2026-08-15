@@ -328,3 +328,24 @@ def test_camera_after_rejects_duplicate_object(tmp_path: Path) -> None:
     with pytest.raises(DrawParseError, match="duplicate CAMERA_AFTER"):
         parse_draw_effect(path)
 
+
+def test_object_effect_malformed_syntax_error_message(tmp_path: Path) -> None:
+    """Requirement 7: OBJECT_EFFECT object_1 effect=draw reports explicit example error message."""
+    path = write_effect(
+        tmp_path / "bad_syntax.srt",
+        """
+        1
+        00:00:00,000 --> 00:00:02,000
+        MODE advanced_draw
+        STYLE v1
+        OBJECT_EFFECT object_1 effect=draw
+        DRAW 0s-2s:
+        """,
+    )
+    with pytest.raises(
+        DrawParseError,
+        match=r"Image 1 OBJECT_EFFECT: expected target=<object_id>; example: OBJECT_EFFECT target=object_1 effect=draw",
+    ):
+        parse_draw_effect(path)
+
+

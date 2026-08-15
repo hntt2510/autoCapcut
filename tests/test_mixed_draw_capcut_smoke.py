@@ -180,3 +180,112 @@ def test_real_mixed_draw_capcut_smoke(tmp_path: Path) -> None:
     assert audio_segs[0]["target_timerange"]["start"] == 0
     assert audio_segs[0]["target_timerange"]["duration"] == 6_000_000
 
+
+def test_production_three_image_advanced_draw_workflow(tmp_path: Path) -> None:
+    """Requirement 9: Production workflow covering 3 images, 1 unified effect.srt, 1 draw_scene.json
+    with 6, 5, and 6 objects respectively rendered through DrawRenderer + CapCutBuilder."""
+    from auto_capcut.core.draw_models import NormalizedRect, SceneDocument, SceneImage, SceneObject
+    from auto_capcut.core.draw_scene import save_scene
+
+    # 1. Create 3 images
+    img_dir = tmp_path / "images"
+    img_dir.mkdir(parents=True, exist_ok=True)
+    img1 = _create_dummy_image(img_dir / "001.png", "white", "Slide 1 (6 objs)")
+    img2 = _create_dummy_image(img_dir / "002.png", "lightblue", "Slide 2 (5 objs)")
+    img3 = _create_dummy_image(img_dir / "003.png", "lightyellow", "Slide 3 (6 objs)")
+
+    audio_file = _create_dummy_wav(tmp_path / "audio.wav", duration_seconds=6.0)
+
+    # 2. Unified effect.srt with 3 advanced_draw cues
+    effect_srt = tmp_path / "unified_effect.srt"
+    effect_srt.write_text(
+        "\n".join([
+            "1",
+            "00:00:00,000 --> 00:00:02,000",
+            "MODE advanced_draw",
+            "STYLE v1",
+            "OBJECT_EFFECT target=obj_1 effect=draw",
+            "DRAW 0s-2s:",
+            "",
+            "2",
+            "00:00:02,000 --> 00:00:04,000",
+            "MODE advanced_draw",
+            "STYLE v1",
+            "OBJECT_EFFECT target=obj_1 effect=draw",
+            "DRAW 0s-2s:",
+            "",
+            "3",
+            "00:00:04,000 --> 00:00:06,000",
+            "MODE advanced_draw",
+            "STYLE v1",
+            "OBJECT_EFFECT target=obj_1 effect=draw",
+            "DRAW 0s-2s:",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+
+    # 3. One canonical draw_scene.json with records for all 3 images:
+    # 001.png: 6 objects, 002.png: 5 objects, 003.png: 6 objects
+    def _make_objs(count: int) -> tuple[SceneObject, ...]:
+        return tuple(
+            SceneObject(id=f"obj_{i}", type="art", box=NormalizedRect(0.05 * i, 0.1, 0.04, 0.04))
+            for i in range(1, count + 1)
+        )
+
+    scene_file = tmp_path / "draw_scene.json"
+    images_map = {
+        "001.png": SceneImage("001.png", (640, 360), _make_objs(6), tuple(f"obj_{i}" for i in range(1, 7))),
+        "002.png": SceneImage("002.png", (640, 360), _make_objs(5), tuple(f"obj_{i}" for i in range(1, 6))),
+        "003.png": SceneImage("003.png", (640, 360), _make_objs(6), tuple(f"obj_{i}" for i in range(1, 7))),
+    }
+    doc = SceneDocument(schema_version=1, images=images_map, path=scene_file)
+    save_scene(doc, scene_file)
+
+    # 4. Build CapCut draft
+    drafts_dir = tmp_path / "drafts"
+    drafts_dir.mkdir(parents=True, exist_ok=True)
+    config = ProjectConfig(
+        project_name="adv_smoke_test",
+        resolution=RESOLUTIONS["1920x1080"],
+        image_folders=[img_dir],
+        audio_path=audio_file,
+        draft_folder=drafts_dir,
+        motion_enabled=True,
+        motion_mode="Effect Direction SRT",
+        effect_direction_srt=effect_srt,
+        draw_enabled=True,
+        draw_scene_json=scene_file,
+        draw_fallback_basic=False,
+    )
+    job = ProjectJob(
+        name="adv_smoke_test",
+        images=(img1, img2, img3),
+        audio_path=audio_file,
+        subtitle_srt=None,
+        image_timing_srt=None,
+        config=config,
+    )
+
+    builder = CapCutBuilder()
+    result = builder.build_job(job)
+
+    assert result.project_path.is_dir()
+    content = json.loads((result.project_path / "draft_content.json").read_text(encoding="utf-8"))
+    tracks = content.get("tracks", [])
+    images_track = next((t for t in tracks if t.get("name") == "Images" or t.get("type") == "video"), None)
+    assert images_track is not None
+    segments = images_track.get("segments", [])
+    assert len(segments) == 3
+
+    videos = content.get("materials", {}).get("videos", [])
+    video_map = {v["id"]: v.get("path", "") for v in videos}
+
+    for idx, seg in enumerate(segments, 1):
+        mat_path = video_map.get(seg.get("material_id"), "")
+        assert mat_path.endswith(f"{idx:03d}_draw.mp4")
+        assert Path(mat_path).is_file()
+        assert seg["target_timerange"]["start"] == (idx - 1) * 2_000_000
+        assert seg["target_timerange"]["duration"] == 2_000_000
+
+

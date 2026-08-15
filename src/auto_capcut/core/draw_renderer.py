@@ -1523,9 +1523,32 @@ def _clip_signature(
     )
 
 
+def _validate_advanced_plan_targets(plan: DrawImagePlan, scene: SceneImage) -> None:
+    available = ", ".join(scene.object_map.keys()) or "none"
+    for override in plan.object_effects:
+        if override.target not in scene.object_map:
+            raise DrawRenderError(
+                f"Image {plan.image_index:03d}: unknown draw object \"{override.target}\". Available objects: {available}"
+            )
+    for cam in plan.camera_after:
+        if cam.object_id and cam.object_id not in scene.object_map:
+            raise DrawRenderError(
+                f"Image {plan.image_index:03d}: unknown draw object \"{cam.object_id}\". Available objects: {available}"
+            )
+        if cam.target and cam.action in {"focus", "pan_to", "pull_to"} and cam.target not in scene.object_map:
+            raise DrawRenderError(
+                f"Image {plan.image_index:03d}: unknown draw object \"{cam.target}\". Available objects: {available}"
+            )
+    for action in plan.actions:
+        target = action.params.get("target")
+        if target and target not in scene.object_map:
+            raise DrawRenderError(
+                f"Image {plan.image_index:03d}: unknown draw object \"{target}\". Available objects: {available}"
+            )
+
+
 class DrawRenderer:
     def __init__(self, cache_root: Path, hand_asset: Path | None = None) -> None:
-
         self.cache_root = cache_root
         asset_root = Path(__file__).resolve().parents[1] / "assets"
         if not (asset_root / "draw_hand.png").is_file() and getattr(sys, "_MEIPASS", None):
@@ -1536,6 +1559,7 @@ class DrawRenderer:
         self.hand_anchor = self._read_anchor(self.hand_asset, "nib_anchor", (0.12, 0.72))
         self.push_side_anchor = self._read_anchor(self.push_side_asset, "contact_anchor", (0.88, 0.50))
         self.push_top_anchor = self._read_anchor(self.push_top_asset, "contact_anchor", (0.50, 0.88))
+
 
     @staticmethod
     def _read_anchor(asset: Path | None, key: str, default: tuple[float, float]) -> tuple[float, float]:
@@ -2084,8 +2108,11 @@ class DrawRenderer:
         return result.convert("RGB")
 
     def render(self, image_path: Path, plan: DrawImagePlan, config: DrawProjectConfig, output_path: Path, scene: SceneImage | None = None, progress=None) -> Path:
+        if scene is not None and plan.mode is DrawMode.ADVANCED:
+            _validate_advanced_plan_targets(plan, scene)
         cache_root = self.cache_root
         cache_root.mkdir(parents=True, exist_ok=True)
+
         text_mode = TextMode(plan.draw_action.params.get("text", TextMode.KEEP.value).casefold())
         artifact = prepare_image(image_path, cache_root, plan.style, text_mode, config.remove_background, scene)
 
@@ -2299,6 +2326,9 @@ class DrawRenderService:
                         )
                     plan = DrawImagePlan(plan.image_index, plan.image_name, plan.start_us, plan.end_us, DrawMode.BASIC, plan.style, "auto", plan.actions)
                     image_scene = None
+                else:
+                    _validate_advanced_plan_targets(plan, image_scene)
+
 
             output_path = config.output_folder / f"{index + 1:03d}_draw.mp4"
 

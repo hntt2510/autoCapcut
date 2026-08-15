@@ -488,12 +488,12 @@ class DrawObjectEditorDialog(QDialog):
 
     def _save(self) -> None:
         images: dict[str, SceneImage] = {}
-        for image in self.images:
-            record = self.records[image.name.casefold()]
+        for record in self.records.values():
             objects = tuple(SceneObject(item["id"], item["type"], item["box"], item["camera"], item.get("render_effect", "draw"), item.get("direction", "auto"), item.get("duration_us"), item.get("pause_after_us"), frozenset(item.get("behavior_fields_present", ()))) for item in record["objects"])
             images[record["filename"]] = SceneImage(record["filename"], record["size"], objects, tuple(record["order"]), record["hash"])
         save_scene(SceneDocument(1, images, self.scene_path), self.scene_path)
         self.accept()
+
 
 
 class DrawPreviewDialog(QDialog):

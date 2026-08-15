@@ -48,6 +48,10 @@ def _properties(text: str, image_index: int, action_name: str) -> dict[str, str]
     cursor = 0
     for match in _PARAM.finditer(text):
         if text[cursor:match.start()].strip(" ,"):
+            if action_name == "OBJECT_EFFECT":
+                raise DrawParseError(
+                    f"Image {image_index} OBJECT_EFFECT: expected target=<object_id>; example: OBJECT_EFFECT target=object_1 effect=draw"
+                )
             raise DrawParseError(f"Image {image_index} {action_name}: malformed parameter list")
         value = match.group(2).strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
@@ -55,6 +59,10 @@ def _properties(text: str, image_index: int, action_name: str) -> dict[str, str]
         params[match.group(1).casefold()] = value
         cursor = match.end()
     if text[cursor:].strip(" ,"):
+        if action_name == "OBJECT_EFFECT":
+            raise DrawParseError(
+                f"Image {image_index} OBJECT_EFFECT: expected target=<object_id>; example: OBJECT_EFFECT target=object_1 effect=draw"
+            )
         raise DrawParseError(f"Image {image_index} {action_name}: malformed parameter list")
     return params
 
@@ -113,7 +121,9 @@ def _parse_action(line: str, image_index: int) -> DrawAction:
 def _parse_object_effect(line: str, image_index: int) -> ObjectEffectOverride:
     match = _OBJECT_EFFECT.fullmatch(line.strip())
     if not match:
-        raise DrawParseError(f"Image {image_index}: malformed OBJECT_EFFECT directive")
+        raise DrawParseError(
+            f"Image {image_index} OBJECT_EFFECT: expected target=<object_id>; example: OBJECT_EFFECT target=object_1 effect=draw"
+        )
     params = _properties(match.group(1).strip(), image_index, "OBJECT_EFFECT")
     allowed = {"target", "effect", "direction", "duration", "pause_after"}
     unknown = sorted(set(params) - allowed)
@@ -122,7 +132,10 @@ def _parse_object_effect(line: str, image_index: int) -> ObjectEffectOverride:
     target = params.get("target", "").strip()
     effect = params.get("effect", "").casefold()
     if not target:
-        raise DrawParseError(f"Image {image_index} OBJECT_EFFECT requires target")
+        raise DrawParseError(
+            f"Image {image_index} OBJECT_EFFECT: expected target=<object_id>; example: OBJECT_EFFECT target=object_1 effect=draw"
+        )
+
     if effect not in {"draw", "slide_in", "drop_in", "push_in", "toss_in", "pop_in"}:
         raise DrawParseError(f"Image {image_index} OBJECT_EFFECT target {target}: invalid effect {params.get('effect', '')}")
     direction = params.get("direction", "auto").casefold()
