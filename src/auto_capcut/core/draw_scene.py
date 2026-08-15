@@ -57,7 +57,9 @@ def load_scene(path: str | Path) -> SceneDocument:
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise SceneValidationError(f"Unable to read scene JSON: {source}: {exc}") from exc
     errors: list[str] = []
-    if not isinstance(raw, dict) or raw.get("schema_version") != 1:
+    # Accept both schema_version=1 (canonical) and version=1 (legacy alias) silently.
+    _schema_v = raw.get("schema_version") if "schema_version" in raw else raw.get("version")
+    if not isinstance(raw, dict) or _schema_v != 1:
         raise SceneValidationError("scene.json: schema_version must be 1")
     raw_images = raw.get("images")
     if not isinstance(raw_images, dict):

@@ -290,6 +290,15 @@ class ProjectConfig:
     music_folder: Optional[Path] = None
     music_volume: float = 0.15
     draft_folder: Optional[Path] = None
+    # ── Draw Animation integration ──────────────────────────────────────────
+    draw_enabled: bool = True
+    draw_effect_srt: Optional[Path] = None      # None → fall back to effect_direction_srt
+    draw_scene_json: Optional[Path] = None
+    draw_remove_background: bool = False
+    draw_fallback_basic: bool = True
+    draw_diagnostics: bool = False
+    draw_reuse_cache: bool = True
+
 
 
 @dataclass(frozen=True)
@@ -300,6 +309,8 @@ class ProjectJob:
     subtitle_srt: Optional[Path]
     image_timing_srt: Optional[Path]
     config: ProjectConfig
+    draw_effect_file: Optional[Path] = None   # resolved path to the draw/unified SRT
+    draw_scene_json: Optional[Path] = None
 
 
 @dataclass(frozen=True)

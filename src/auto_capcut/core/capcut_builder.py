@@ -20,7 +20,7 @@ from auto_capcut.core.planning import resolve_effect_directions, resolve_timings
 from auto_capcut.core.roi_resolver import ManualRoiResolver, roi_sidecar_path
 from auto_capcut.core.srt_parser import parse_srt
 from auto_capcut.core.validation import validate_draft_json
-from auto_capcut.models import BuildResult, ImageTiming, ProjectJob, ProgressCallback
+from auto_capcut.models import BuildResult, ImageTiming, ProjectConfig, ProjectJob, ProgressCallback
 from auto_capcut.utils.paths import unique_project_name
 
 
@@ -47,6 +47,13 @@ class CapCutBuilder:
         timings, duration_us = resolve_timings(job)
         effects = resolve_effect_directions(job, timings)
         warnings: list[str] = []
+
+        # ── Draw rendering integration ─────────────────────────────────────
+        draw_clips: dict[int, Path] = {}   # {0-based image index -> rendered MP4}
+        if job.config.draw_enabled:
+            draw_clips = self._render_draw_clips(job, timings, progress, warnings)
+        # ──────────────────────────────────────────────────────────────────
+
         captured_effects, captured_keys = self._resolve_captured_effects(effects, timings, warnings)
         validate_required_rois(job, effects)
         progress(25, "Creating CapCut Draft...")
@@ -59,11 +66,13 @@ class CapCutBuilder:
             fallback_alerts = bool(effects and any(
                 effect.type == "ALERT" and (cue_index, effect_index) not in captured_keys
                 for cue_index, cue in enumerate(effects)
+                if cue is not None
                 for effect_index, effect in enumerate(cue.effects)
             ))
+
             self._add_tracks(script, fallback_alerts)
             progress(35, "Adding images...")
-            self._add_images(script, job, timings, warnings, effects, captured_keys)
+            self._add_images(script, job, timings, warnings, effects, captured_keys, draw_clips)
             progress(58, "Applying motion and transitions...")
             # Motion/transitions are attached while image segments are created.
             progress(67, "Adding main audio...")
@@ -116,12 +125,31 @@ class CapCutBuilder:
         if warning_overlays:
             script.add_track(cc.TrackType.video, "Warning Overlays", absolute_index=25)
 
-    def _add_images(self, script, job: ProjectJob, timings: list[ImageTiming], warnings: list[str], effects=None, captured_keys=frozenset()) -> None:
+    def _add_images(self, script, job: ProjectJob, timings: list[ImageTiming], warnings: list[str], effects=None, captured_keys=frozenset(), draw_clips: dict[int, Path] | None = None) -> None:
         cc = self.cc
         manual_resolver = ManualRoiResolver(roi_sidecar_path(job.config.effect_direction_srt)) if effects and job.config.effect_direction_srt else None
         roi_resolver = manual_resolver
         engine = MotionEngine(job.config.resolution.width, job.config.resolution.height, job.config.motion_strength, roi_resolver)
         for index, (image_path, timing) in enumerate(zip(job.images, timings)):
+            # ── Draw clip substitution ─────────────────────────────────────
+            draw_mp4 = (draw_clips or {}).get(index)
+            if draw_mp4 is not None and draw_mp4.is_file():
+                material = cc.VideoMaterial(str(draw_mp4))
+                base_scale = engine.capcut_cover_scale(job.config.resolution.width, job.config.resolution.height, material.width, material.height)
+                segment = cc.VideoSegment(
+                    material,
+                    cc.Timerange(timing.start_us, timing.duration_us),
+                    clip_settings=cc.ClipSettings(scale_x=base_scale, scale_y=base_scale),
+                )
+                # Draw clips do not get additional motion effects; the renderer
+                # controls all visual motion internally.
+                if effects and job.config.transition_enabled and index < len(job.images) - 1:
+                    self._maybe_add_transition(segment, effects[index], timing, timings[index + 1], job, warnings, index)
+                elif job.config.transition_enabled and index < len(job.images) - 1:
+                    self._maybe_add_transition(segment, None, timing, timings[index + 1], job, warnings, index)
+                script.add_segment(segment, "Images")
+                continue
+            # ── Standard image path ────────────────────────────────────────
             material = cc.VideoMaterial(str(image_path))
             base_scale = engine.capcut_cover_scale(job.config.resolution.width, job.config.resolution.height, material.width, material.height)
             segment = cc.VideoSegment(
@@ -129,7 +157,7 @@ class CapCutBuilder:
                 cc.Timerange(timing.start_us, timing.duration_us),
                 clip_settings=cc.ClipSettings(scale_x=base_scale, scale_y=base_scale),
             )
-            if effects:
+            if effects and effects[index] is not None:
                 plan = engine.plan_effect(effects[index], image_path, material.width, material.height, timing.duration_us)
                 warnings.extend(plan.warnings)
             elif job.config.motion_enabled:
@@ -138,24 +166,113 @@ class CapCutBuilder:
                 plan = None
             if plan:
                 self._apply_motion_plan(segment, plan, base_scale)
-            if effects:
+            if effects and effects[index] is not None:
                 self._add_alert_overlays(script, effects[index], image_path, timing, job, base_scale, plan, manual_resolver, index, captured_keys)
             if job.config.transition_enabled and index < len(job.images) - 1:
-                soft_cut = effects and effects[index].transition_out and effects[index].transition_out.casefold() == "soft cut"
-                transition_duration = min(
-                    job.config.transition_duration_us,
-                    timing.duration_us // 2,
-                    timings[index + 1].duration_us // 2,
-                )
-                if transition_duration > 0 and not soft_cut:
-                    transition_type = self._blur_transition_type()
-                    if transition_type is not None:
-                        segment.add_transition(transition_type, duration=transition_duration)
-                        if transition_duration < job.config.transition_duration_us:
-                            warnings.append(f"Transition {index + 1} shortened to {transition_duration / 1_000_000:.3f}s")
+                self._maybe_add_transition(segment, effects[index] if effects else None, timing, timings[index + 1], job, warnings, index)
             script.add_segment(segment, "Images")
+
         if manual_resolver:
             warnings.extend(dict.fromkeys(manual_resolver.warnings))
+
+    def _maybe_add_transition(self, segment, effect, timing: ImageTiming, next_timing: ImageTiming, job: ProjectJob, warnings: list[str], index: int) -> None:
+        """Conditionally attach a blur transition to *segment*."""
+        soft_cut = effect and effect.transition_out and effect.transition_out.casefold() == "soft cut"
+        transition_duration = min(
+            job.config.transition_duration_us,
+            timing.duration_us // 2,
+            next_timing.duration_us // 2,
+        )
+        if transition_duration > 0 and not soft_cut:
+            transition_type = self._blur_transition_type()
+            if transition_type is not None:
+                segment.add_transition(transition_type, duration=transition_duration)
+                if transition_duration < job.config.transition_duration_us:
+                    warnings.append(f"Transition {index + 1} shortened to {transition_duration / 1_000_000:.3f}s")
+
+    def _render_draw_clips(self, job: ProjectJob, timings: list[ImageTiming], progress, warnings: list[str]) -> dict[int, Path]:
+        """Pre-render draw clips for all draw cues and return a map of index -> MP4 path."""
+        from auto_capcut.core.unified_effect_parser import parse_unified_effect, UnifiedEffectFile
+        from auto_capcut.core.draw_models import DrawProjectConfig
+        from auto_capcut.core.draw_renderer import DrawRenderService
+
+        # Determine which SRT to parse for draw cues
+        draw_srt = job.config.draw_effect_srt or job.config.effect_direction_srt
+        if draw_srt is None or not draw_srt.is_file():
+            return {}
+
+        try:
+            unified = parse_unified_effect(draw_srt)
+        except Exception as exc:
+            warnings.append(f"Draw effect SRT parse error: {exc}")
+            return {}
+
+        if not unified.has_draw_cues:
+            return {}
+
+        # Map cue index (1-based) to 0-based image index, then filter draw cues
+        draw_plans_by_img: dict[int, object] = {}   # {0-based image index -> DrawImagePlan}
+        draw_indexes: list[int] = []
+        for cue in unified.cues:
+            img_idx = cue.index - 1  # 0-based
+            if cue.kind == "draw" and cue.draw_plan is not None and img_idx < len(job.images):
+                draw_plans_by_img[img_idx] = cue.draw_plan
+                draw_indexes.append(img_idx)
+
+        if not draw_indexes:
+            return {}
+
+        # Build parallel draw_plans list indexed same as job.images
+        aligned_plans = [draw_plans_by_img.get(i) for i in range(len(job.images))]
+        # Fill None slots with a placeholder (they won't be rendered since only draw_indexes are passed)
+        from auto_capcut.core.draw_models import DrawMode, DrawStyle, DrawImagePlan as _DIP
+        for i in range(len(aligned_plans)):
+            if aligned_plans[i] is None:
+                aligned_plans[i] = _DIP(
+                    i + 1, None, 0,
+                    timings[i].duration_us if i < len(timings) else 1_000_000,
+                    DrawMode.BASIC, DrawStyle.V2, "auto",
+                    (),  # no actions — placeholder only, not rendered
+                )
+
+        resolution = (job.config.resolution.width, job.config.resolution.height)
+        cache_root = (job.config.draft_folder / ".autocapcut_draw_cache") if job.config.draft_folder else Path(tempfile.mkdtemp())
+        draw_output_folder = cache_root / "clips"
+        draw_output_folder.mkdir(parents=True, exist_ok=True)
+
+        draw_config = DrawProjectConfig(
+            image_folder=job.images[0].parent if job.images else Path("."),
+            effect_file=draw_srt,
+            output_folder=draw_output_folder,
+            scene_file=job.draw_scene_json or job.config.draw_scene_json,
+            resolution=resolution,
+            fps=30,
+            remove_background=job.config.draw_remove_background,
+            fallback_basic=job.config.draw_fallback_basic,
+            advanced_diagnostics=job.config.draw_diagnostics,
+        )
+
+        progress(20, f"Rendering {len(draw_indexes)} draw clip(s)...")
+
+        def draw_progress(value: int, message: str) -> None:
+            progress(20 + round(value * 0.15), message)
+
+        service = DrawRenderService()
+        try:
+            rendered = service.render_subset(
+                draw_config,
+                aligned_plans,
+                list(job.images),
+                draw_indexes,
+                progress=draw_progress,
+            )
+        except Exception as exc:
+            warnings.append(f"Draw rendering failed: {exc}")
+            return {}
+
+        progress(35, "Draw clips ready.")
+        return rendered
+
 
 
     def _apply_motion_plan(self, segment, plan, base_scale: float) -> None:

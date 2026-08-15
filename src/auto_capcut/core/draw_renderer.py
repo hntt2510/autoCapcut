@@ -2126,3 +2126,85 @@ class DrawRenderService:
             output = config.output_folder / f"{index + 1:03d}_draw.mp4"
             outputs.append(renderer.render(images[index], plan, config, output, image_scene, progress))
         return outputs
+
+    def render_subset(
+        self,
+        config: DrawProjectConfig,
+        draw_plans: list[DrawImagePlan],
+        images: list[Path],
+        image_indexes: list[int],
+        scene_document=None,
+        progress=None,
+    ) -> dict[int, Path]:
+        """Render a specific subset of draw images.
+
+        Parameters
+        ----------
+        config:
+            DrawProjectConfig used for resolution, cache, remove_background, etc.
+        draw_plans:
+            DrawImagePlan objects in the same positional order as ``images``.
+        images:
+            All project images (full list). ``image_indexes`` selects which ones
+            to render.
+        image_indexes:
+            0-based indexes into ``images`` / ``draw_plans`` to render.
+        scene_document:
+            Optional pre-loaded SceneDocument; if None, ``config.scene_file`` is used.
+        progress:
+            Optional progress callback ``(value: int, message: str) -> None``.
+
+        Returns
+        -------
+        dict[int, Path]
+            Map of ``{0-based image index -> rendered mp4 path}``.
+        """
+        # Resolve scene document once
+        scene_doc = scene_document
+        scene_errors: list[str] = []
+        if scene_doc is None and config.scene_file and config.scene_file.is_file():
+            advanced_indexes = [i for i in image_indexes if i < len(draw_plans) and draw_plans[i].mode is DrawMode.ADVANCED]
+            if advanced_indexes:
+                try:
+                    scene_doc = load_scene(config.scene_file)
+                    scene_errors = validate_scene_document(scene_doc, images, config.resolution)
+                except SceneValidationError as exc:
+                    if not config.fallback_basic:
+                        raise DrawRenderError(str(exc)) from exc
+                    scene_errors = [str(exc)]
+
+        renderer = self.renderer or DrawRenderer(config.output_folder / ".autocapcut_draw_cache")
+        outputs: dict[int, Path] = {}
+        total = len(image_indexes)
+        for step, index in enumerate(image_indexes):
+            if index < 0 or index >= len(images) or index >= len(draw_plans):
+                raise DrawRenderError(f"Draw image index out of range: {index}")
+            plan = draw_plans[index]
+            image_path = images[index]
+            if plan.image_name and plan.image_name.casefold() != image_path.name.casefold():
+                raise DrawRenderError(f"Draw image {index + 1}: IMAGE={plan.image_name} does not match {image_path.name}")
+            image_scene = None
+            if plan.mode is DrawMode.ADVANCED and scene_doc:
+                image_scene = next(
+                    (v for k, v in scene_doc.images.items() if k.casefold() == image_path.name.casefold()),
+                    None,
+                )
+                missing = [e for e in scene_errors if e.casefold().startswith(f"image {image_path.name}".casefold())]
+                if image_scene is None or missing:
+                    if not config.fallback_basic:
+                        raise DrawRenderError(
+                            "Advanced draw scene errors:\n" + "\n".join(f"- {e}" for e in (missing or [f"Image {image_path.name}: scene record missing"]))
+                        )
+                    plan = DrawImagePlan(plan.image_index, plan.image_name, plan.start_us, plan.end_us, DrawMode.BASIC, plan.style, "auto", plan.actions)
+                    image_scene = None
+
+            output_path = config.output_folder / f"{index + 1:03d}_draw.mp4"
+
+            def _sub_progress(value: int, message: str, step=step, total=total, progress=progress) -> None:
+                if progress:
+                    offset = round(step * 100 / max(1, total))
+                    progress(min(99, offset + round(value / max(1, total))), message)
+
+            outputs[index] = renderer.render(image_path, plan, config, output_path, image_scene, _sub_progress)
+        return outputs
+

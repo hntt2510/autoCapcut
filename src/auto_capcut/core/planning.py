@@ -4,11 +4,11 @@ from pathlib import Path
 
 from auto_capcut.core.errors import ValidationError
 from auto_capcut.core.effect_direction_parser import validate_effect_timing
-from auto_capcut.core.effect_direction_parser import parse_effect_direction_srt
+from auto_capcut.core.unified_effect_parser import parse_unified_effect
 from auto_capcut.core.roi_resolver import ManualRoiResolver, roi_sidecar_path, validate_saved_frame
 from auto_capcut.core.media import collect_audio, collect_images, probe_duration_us, validate_config_paths
 from auto_capcut.core.srt_parser import parse_image_timing_srt
-from auto_capcut.models import AudioMode, ImageTiming, ProjectConfig, ProjectJob
+from auto_capcut.models import AudioMode, EffectCue, ImageTiming, ProjectConfig, ProjectJob
 from auto_capcut.utils.paths import safe_name
 
 TIMING_TOLERANCE_US = 50_000
@@ -57,33 +57,44 @@ def resolve_timings(job: ProjectJob) -> tuple[list[ImageTiming], int]:
     return calculate_ranges(len(job.images), audio_duration), audio_duration
 
 
-def resolve_effect_directions(job: ProjectJob, timings: list[ImageTiming]):
+def resolve_effect_directions(job: ProjectJob, timings: list[ImageTiming]) -> list[EffectCue | None] | None:
     mode = str(getattr(job.config, "motion_mode", "")).casefold()
     if not job.config.motion_enabled or mode != "effect direction srt":
         return None
     effect_path = job.config.effect_direction_srt
     if effect_path is None:
         raise ValidationError("Effect Direction SRT does not exist")
-    effects = parse_effect_direction_srt(effect_path)
-    if len(effects) != len(timings):
-        raise ValidationError(f"Effect Direction mismatch: {len(timings)} images / {len(effects)} effect cues")
-    for effect, timing in zip(effects, timings):
-        directive_end = [phase.local_end_us for phase in effect.effects]
-        max_directive_end = max(directive_end, default=0)
-        if max_directive_end > timing.duration_us + 50_000:
-            raise ValidationError(f"Effect SRT error: Image {effect.image_index} phase exceeds image duration")
+    unified = parse_unified_effect(effect_path)
+    if len(unified.cues) != len(timings):
+        raise ValidationError(f"Effect Direction mismatch: {len(timings)} images / {len(unified.cues)} effect cues")
+    effects: list[EffectCue | None] = []
+    for cue, timing in zip(unified.cues, timings):
+        if cue.kind == "standard" and cue.effect_cue is not None:
+            effect = cue.effect_cue
+            directive_end = [phase.local_end_us for phase in effect.effects]
+            max_directive_end = max(directive_end, default=0)
+            if max_directive_end > timing.duration_us + 50_000:
+                raise ValidationError(f"Effect SRT error: Image {effect.image_index} phase exceeds image duration")
+            effects.append(effect)
+        else:
+            effects.append(None)
     if job.image_timing_srt:
-        validate_effect_timing(effects, timings)
+        std_effects = [e for e in effects if e is not None]
+        if std_effects:
+            std_timings = [t for e, t in zip(effects, timings) if e is not None]
+            validate_effect_timing(std_effects, std_timings)
     return effects
 
 
-def validate_required_rois(job: ProjectJob, effects) -> None:
+def validate_required_rois(job: ProjectJob, effects: list[EffectCue | None] | None) -> None:
     if not effects or job.config.effect_direction_srt is None:
         return
     resolver = ManualRoiResolver(roi_sidecar_path(job.config.effect_direction_srt))
     canvas_size = (job.config.resolution.width, job.config.resolution.height)
     missing: dict[int, list[str]] = {}
     for cue in effects:
+        if cue is None:
+            continue
         for target in cue.required_roi_targets:
             image = job.images[target.image_index - 1]
             frame = resolver.resolve(image, target.target_id, target.image_index)
@@ -100,3 +111,4 @@ def validate_required_rois(job: ProjectJob, effects) -> None:
             lines.append(f"Image {image_index:03d}:")
             lines.extend(f"- {target}" for target in targets)
         raise ValidationError("\n".join(lines))
+
