@@ -800,6 +800,13 @@ def _auto_camera_duration_us(start_state: CameraState, end_state: CameraState, a
     return round(max(0.40, min(0.75, dur_s)) * 1_000_000)
 
 
+def _auto_camera_return_duration_us(start_state: CameraState, end_state: CameraState = FULL_VIEW_STATE) -> int:
+    dist = math.hypot(end_state.center_x - start_state.center_x, end_state.center_y - start_state.center_y)
+    scale_delta = abs(math.log(max(1e-6, end_state.scale)) - math.log(max(1e-6, start_state.scale)))
+    dur_s = 0.35 + dist * 0.20 + scale_delta * 0.15
+    return round(max(0.35, min(0.55, dur_s)) * 1_000_000)
+
+
 def _camera_state_at(
     schedule: DrawSchedule,
     plan: DrawImagePlan,
@@ -808,11 +815,11 @@ def _camera_state_at(
     canvas_aspect: float,
     source_size: tuple[int, int],
 ) -> CameraState:
-    camera_phases = [p for p in schedule.phases if p.kind in {"camera", "camera_hold", "camera_staging"}]
+    camera_phases = [p for p in schedule.phases if p.kind in {"camera", "camera_hold", "camera_staging", "camera_return"}]
     current_state = FULL_VIEW_STATE
     if camera_phases:
         for phase in schedule.phases:
-            if phase.kind in {"camera", "camera_staging"}:
+            if phase.kind in {"camera", "camera_staging", "camera_return"}:
                 if phase.camera_start is not None and phase.camera_end is not None:
                     if phase.start_us <= time_us < phase.end_us:
                         fraction = (time_us - phase.start_us) / max(1, phase.duration_us)
@@ -1164,6 +1171,7 @@ def _build_advanced_schedule(strokes: tuple[Stroke, ...], plan: DrawImagePlan, s
     cam_targets: dict[str, tuple[CameraState, str, bool]] = {}
     desired_cam_durations: dict[str, int] = {}
     desired_cam_holds: dict[str, int] = {}
+    desired_cam_returns: dict[str, int] = {}
     desired_staging_durations: dict[str, int] = {}
     staging_targets: dict[str, tuple[CameraState, str]] = {}
     cam_sim = FULL_VIEW_STATE
@@ -1194,7 +1202,18 @@ def _build_advanced_schedule(strokes: tuple[Stroke, ...], plan: DrawImagePlan, s
                 cam_dur = _auto_camera_duration_us(cam_sim, tgt_state, cam_dir.action)
             desired_cam_durations[group.object_id] = cam_dur
             desired_cam_holds[group.object_id] = cam_dir.hold_us
-            cam_sim = tgt_state
+
+            # Return duration calculation (transient emphasis camera)
+            if not cam_dir.persist and tgt_state != FULL_VIEW_STATE:
+                if cam_dir.return_duration_mode == "fixed" and cam_dir.return_duration_us is not None:
+                    ret_dur = cam_dir.return_duration_us
+                else:
+                    ret_dur = _auto_camera_return_duration_us(tgt_state, FULL_VIEW_STATE)
+                desired_cam_returns[group.object_id] = ret_dur
+                cam_sim = FULL_VIEW_STATE
+            else:
+                desired_cam_returns[group.object_id] = 0
+                cam_sim = tgt_state
 
     draw_count = sum(1 for group in active if group.effect == DrawObjectEffect.DRAW.value)
     default_reveal_us = 250_000
@@ -1205,9 +1224,10 @@ def _build_advanced_schedule(strokes: tuple[Stroke, ...], plan: DrawImagePlan, s
     local_finalize_total = local_reveal_us * draw_count
     total_cam_durations = sum(desired_cam_durations.values())
     total_cam_holds = sum(desired_cam_holds.values())
+    total_cam_returns = sum(desired_cam_returns.values())
     total_staging_durations = sum(desired_staging_durations.values())
 
-    fixed_total = sum(desired) + sum(pauses) + sum(transitions) + local_finalize_total + total_cam_durations + total_cam_holds + total_staging_durations
+    fixed_total = sum(desired) + sum(pauses) + sum(transitions) + local_finalize_total + total_cam_durations + total_cam_holds + total_cam_returns + total_staging_durations
     warnings = list(fallbacks)
 
     if fixed_total > budget and fixed_total:
@@ -1223,7 +1243,11 @@ def _build_advanced_schedule(strokes: tuple[Stroke, ...], plan: DrawImagePlan, s
             item.hold_us for item in plan.camera_after
             if item.hold_us > 0
         ]
-        strictly_fixed_srt = sum(srt_fixed_effects) + sum(srt_fixed_cameras) + sum(srt_fixed_holds)
+        srt_fixed_returns = [
+            item.return_duration_us for item in plan.camera_after
+            if item.return_duration_mode == "fixed" and item.return_duration_us is not None and not item.persist
+        ]
+        strictly_fixed_srt = sum(srt_fixed_effects) + sum(srt_fixed_cameras) + sum(srt_fixed_holds) + sum(srt_fixed_returns)
         if strictly_fixed_srt > budget and budget > 0:
             available_s = budget / 1_000_000
             required_s = strictly_fixed_srt / 1_000_000
@@ -1241,13 +1265,16 @@ def _build_advanced_schedule(strokes: tuple[Stroke, ...], plan: DrawImagePlan, s
         for k in desired_cam_durations:
             if camera_after_by_obj[k].duration_mode == "auto":
                 desired_cam_durations[k] = max(0, round(desired_cam_durations[k] * scale))
+        for k in desired_cam_returns:
+            if camera_after_by_obj[k].return_duration_mode == "auto":
+                desired_cam_returns[k] = max(0, round(desired_cam_returns[k] * scale))
         for k in desired_staging_durations:
             desired_staging_durations[k] = max(0, round(desired_staging_durations[k] * scale))
-        avail_for_effects = max(0, budget - local_finalize_total - sum(desired_cam_durations.values()) - sum(desired_cam_holds.values()) - sum(desired_staging_durations.values()) - sum(pauses) - sum(transitions))
+        avail_for_effects = max(0, budget - local_finalize_total - sum(desired_cam_durations.values()) - sum(desired_cam_holds.values()) - sum(desired_cam_returns.values()) - sum(desired_staging_durations.values()) - sum(pauses) - sum(transitions))
         desired = _allocate_weighted(avail_for_effects, desired)
         warnings.append(ObjectEffectFallback("__schedule__", "", "", "", f"requested sequence duration {fixed_total / 1_000_000:.3f}s exceeded sketch budget; scaled by {scale:.3f}"))
 
-    used = sum(desired) + sum(pauses) + sum(transitions) + local_finalize_total + sum(desired_cam_durations.values()) + sum(desired_cam_holds.values()) + sum(desired_staging_durations.values())
+    used = sum(desired) + sum(pauses) + sum(transitions) + local_finalize_total + sum(desired_cam_durations.values()) + sum(desired_cam_holds.values()) + sum(desired_cam_returns.values()) + sum(desired_staging_durations.values())
     remaining = max(0, budget - used)
     if auto_draw:
         extras = _allocate_weighted(remaining, [active[index].path_length or len(active[index].strokes) or 1 for index in auto_draw])
@@ -1302,6 +1329,12 @@ def _build_advanced_schedule(strokes: tuple[Stroke, ...], plan: DrawImagePlan, s
             if cam_hold > 0:
                 phases.append(SchedulePhase("camera_hold", cursor, cursor + cam_hold, index, group.object_id, camera_start=cam_state, camera_end=cam_state, camera_action=cam_dir.action, camera_target=cam_dir.target or group.object_id, framing_source=frame_src))
                 cursor += cam_hold
+
+            cam_ret = desired_cam_returns.get(group.object_id, 0)
+            if cam_ret > 0:
+                phases.append(SchedulePhase("camera_return", cursor, cursor + cam_ret, index, group.object_id, camera_start=cam_state, camera_end=FULL_VIEW_STATE, camera_easing=cam_dir.easing, camera_action="focus_return", camera_target="", framing_source="full_view"))
+                cursor += cam_ret
+                cam_state = FULL_VIEW_STATE
 
         if index < len(active) - 1:
             pause = pauses[index]
@@ -1570,6 +1603,7 @@ class DrawRenderer:
         group_phases: dict[str, SchedulePhase] = {}
         camera_phases_by_obj: dict[str, SchedulePhase] = {}
         camera_hold_phases_by_obj: dict[str, SchedulePhase] = {}
+        camera_return_phases_by_obj: dict[str, SchedulePhase] = {}
         for phase in schedule.phases:
             if phase.kind == "object":
                 group_phases[phase.object_id] = phase
@@ -1577,6 +1611,8 @@ class DrawRenderer:
                 camera_phases_by_obj[phase.object_id] = phase
             elif phase.kind == "camera_hold":
                 camera_hold_phases_by_obj[phase.object_id] = phase
+            elif phase.kind == "camera_return":
+                camera_return_phases_by_obj[phase.object_id] = phase
 
         for idx, group in enumerate(schedule.groups):
             phase = group_phases.get(group.object_id)
@@ -1619,6 +1655,8 @@ class DrawRenderer:
                 cam_at_start = phase.camera_start or FULL_VIEW_STATE
                 cov_mid = _box_intersection_ratio(group.object_box, cam_at_start.viewport) * 100.0
                 is_vis = "YES" if cov_mid >= 20.0 else "NO"
+                cam_label = "FULL_VIEW" if cam_at_start == FULL_VIEW_STATE else f"center=({cam_at_start.center_x:.3f}, {cam_at_start.center_y:.3f}) scale={cam_at_start.scale:.2f}"
+                lines.append(f"  Camera before effect: {cam_label}")
                 lines.append(f"  Camera viewport at effect start: ({cam_at_start.x:.3f}, {cam_at_start.y:.3f}, {cam_at_start.w:.3f}, {cam_at_start.h:.3f})")
                 lines.append(f"  Object bbox: ({group.object_box.x:.3f}, {group.object_box.y:.3f}, {group.object_box.w:.3f}, {group.object_box.h:.3f})")
                 lines.append(f"  Visible during entrance: {is_vis}")
@@ -1627,6 +1665,7 @@ class DrawRenderer:
             if group.object_id in camera_phases_by_obj:
                 cam = camera_phases_by_obj[group.object_id]
                 hold = camera_hold_phases_by_obj.get(group.object_id)
+                ret = camera_return_phases_by_obj.get(group.object_id)
                 hold_s = (hold.duration_us / 1_000_000) if hold else 0.0
                 start_st = cam.camera_start or FULL_VIEW_STATE
                 end_st = cam.camera_end or FULL_VIEW_STATE
@@ -1635,9 +1674,30 @@ class DrawRenderer:
                 lines.append(f"    Target: {cam.camera_target}")
                 lines.append(f"    Frame source: {cam.framing_source}")
                 lines.append(f"    Camera timing: {cam.start_us / 1_000_000:.2f} -> {cam.end_us / 1_000_000:.2f} s ({cam.duration_us / 1_000_000:.3f}s)")
-                lines.append(f"    Hold timing: {hold_s:.2f} s")
+                lines.append(f"    FOCUS:")
+                lines.append(f"      IN {cam.start_us / 1_000_000:.2f} -> {cam.end_us / 1_000_000:.2f}")
+                lines.append(f"      Target: {cam.camera_target}")
+                lines.append(f"      Focus state: center=({end_st.center_x:.3f}, {end_st.center_y:.3f}) scale={end_st.scale:.2f}")
+                if hold:
+                    lines.append(f"    HOLD: {hold.start_us / 1_000_000:.2f} -> {hold.end_us / 1_000_000:.2f} ({hold_s:.3f}s)")
+                    lines.append(f"    Hold timing: {hold_s:.2f} s")
+                else:
+                    lines.append(f"    HOLD: 0.00s")
+                    lines.append(f"    Hold timing: 0.00 s")
+                if ret:
+                    lines.append(f"    FOCUS RETURN: {ret.start_us / 1_000_000:.2f} -> {ret.end_us / 1_000_000:.2f} ({ret.duration_us / 1_000_000:.3f}s)")
+                    lines.append(f"    Return timing: {ret.start_us / 1_000_000:.2f} -> {ret.end_us / 1_000_000:.2f} s ({ret.duration_us / 1_000_000:.3f}s)")
+                    lines.append(f"    Camera after focus: FULL_VIEW")
                 lines.append(f"    Start state: center=({start_st.center_x:.3f}, {start_st.center_y:.3f}) scale={start_st.scale:.2f} viewport=({start_st.x:.3f}, {start_st.y:.3f}, {start_st.w:.3f}, {start_st.h:.3f})")
                 lines.append(f"    End state: center=({end_st.center_x:.3f}, {end_st.center_y:.3f}) scale={end_st.scale:.2f} viewport=({end_st.x:.3f}, {end_st.y:.3f}, {end_st.w:.3f}, {end_st.h:.3f})")
+
+            if idx < len(schedule.groups) - 1:
+                next_grp = schedule.groups[idx + 1]
+                next_phase = group_phases.get(next_grp.object_id)
+                next_cam = next_phase.camera_start if next_phase and next_phase.camera_start else FULL_VIEW_STATE
+                next_label = "FULL_VIEW" if next_cam == FULL_VIEW_STATE else f"center=({next_cam.center_x:.3f}, {next_cam.center_y:.3f}) scale={next_cam.scale:.2f}"
+                lines.append(f"NEXT OBJECT: {next_grp.object_id}")
+                lines.append(f"  Camera at effect start: {next_label}")
 
         if schedule.fallbacks:
             lines.extend(("", "Fallbacks:"))

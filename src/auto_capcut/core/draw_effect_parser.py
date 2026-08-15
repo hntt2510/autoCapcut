@@ -149,7 +149,7 @@ def _parse_camera_after(line: str, image_index: int) -> CameraAfterDirective:
     if not match:
         raise DrawParseError(f"Image {image_index}: malformed CAMERA_AFTER directive")
     params = _properties(match.group(1).strip(), image_index, "CAMERA_AFTER")
-    allowed = {"object", "action", "target", "duration", "hold", "framing", "easing"}
+    allowed = {"object", "action", "target", "duration", "hold", "framing", "easing", "return_duration", "persist"}
     unknown = sorted(set(params) - allowed)
     if unknown:
         raise DrawParseError(f"Image {image_index} CAMERA_AFTER: unsupported parameter(s): {', '.join(unknown)}")
@@ -175,13 +175,32 @@ def _parse_camera_after(line: str, image_index: int) -> CameraAfterDirective:
     hold_us = 0
     if "hold" in params:
         hold_us = _seconds(params["hold"], f"Image {image_index} CAMERA_AFTER {object_id} hold")
+    return_duration_us = None
+    return_duration_mode = "auto"
+    if "return_duration" in params:
+        if params["return_duration"].casefold() == "auto":
+            return_duration_mode = "auto"
+        else:
+            return_duration_us = _seconds(params["return_duration"], f"Image {image_index} CAMERA_AFTER {object_id} return_duration")
+            if return_duration_us <= 0:
+                raise DrawParseError(f"Image {image_index} CAMERA_AFTER {object_id} return_duration must be positive")
+            return_duration_mode = "fixed"
+    persist = False
+    if "persist" in params:
+        val = params["persist"].casefold()
+        if val in {"true", "1", "yes"}:
+            persist = True
+        elif val in {"false", "0", "no"}:
+            persist = False
+        else:
+            raise DrawParseError(f"Image {image_index} CAMERA_AFTER {object_id}: persist must be true or false")
     framing = params.get("framing", "camera_frame").casefold()
     if framing not in {"camera_frame", "object_frame", "object_box"}:
         raise DrawParseError(f"Image {image_index} CAMERA_AFTER {object_id} framing is invalid")
     easing = params.get("easing", "ease_in_out").casefold()
     if easing not in {"ease_in_out", "linear"}:
         raise DrawParseError(f"Image {image_index} CAMERA_AFTER {object_id} easing is invalid")
-    return CameraAfterDirective(object_id, action, target, duration_us, duration_mode, hold_us, framing, easing)
+    return CameraAfterDirective(object_id, action, target, duration_us, duration_mode, hold_us, framing, easing, return_duration_us, return_duration_mode, persist)
 
 
 def parse_draw_effect(path: str | Path) -> DrawEffectFile:

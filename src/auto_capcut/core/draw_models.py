@@ -125,6 +125,9 @@ class CameraAfterDirective:
     hold_us: int = 0
     framing: str = "camera_frame"
     easing: str = "ease_in_out"
+    return_duration_us: int | None = None
+    return_duration_mode: str = "auto"
+    persist: bool = False
 
 
 @dataclass(frozen=True)

@@ -215,8 +215,8 @@ def test_camera_after_parsing_valid(tmp_path: Path) -> None:
         00:00:00,000 --> 00:00:05,000
         MODE advanced_draw
         STYLE v2
-        CAMERA_AFTER object=object_1 action=focus target=object_1 duration=0.55 hold=0.15 framing=camera_frame easing=ease_in_out
-        CAMERA_AFTER object=object_2 action=pan_to target=object_2 duration=auto hold=0.10
+        CAMERA_AFTER object=object_1 action=focus target=object_1 duration=0.55 hold=0.15 return_duration=0.45 persist=false framing=camera_frame easing=ease_in_out
+        CAMERA_AFTER object=object_2 action=pan_to target=object_2 duration=auto hold=0.10 return_duration=auto persist=true
         CAMERA_AFTER object=object_6 action=full_view duration=0.70 hold=0.20 easing=linear
         DRAW 0s-5s:
         """,
@@ -231,6 +231,9 @@ def test_camera_after_parsing_valid(tmp_path: Path) -> None:
     assert c1.duration_us == 550_000
     assert c1.duration_mode == "fixed"
     assert c1.hold_us == 150_000
+    assert c1.return_duration_us == 450_000
+    assert c1.return_duration_mode == "fixed"
+    assert c1.persist is False
     assert c1.framing == "camera_frame"
     assert c1.easing == "ease_in_out"
 
@@ -241,6 +244,9 @@ def test_camera_after_parsing_valid(tmp_path: Path) -> None:
     assert c2.duration_us is None
     assert c2.duration_mode == "auto"
     assert c2.hold_us == 100_000
+    assert c2.return_duration_us is None
+    assert c2.return_duration_mode == "auto"
+    assert c2.persist is True
     assert c2.framing == "camera_frame"
     assert c2.easing == "ease_in_out"
 
@@ -251,6 +257,9 @@ def test_camera_after_parsing_valid(tmp_path: Path) -> None:
     assert c3.duration_us == 700_000
     assert c3.duration_mode == "fixed"
     assert c3.hold_us == 200_000
+    assert c3.return_duration_us is None
+    assert c3.return_duration_mode == "auto"
+    assert c3.persist is False
     assert c3.easing == "linear"
 
 
@@ -262,6 +271,10 @@ def test_camera_after_parsing_valid(tmp_path: Path) -> None:
         ("CAMERA_AFTER object=obj1 action=focus duration=fast", "duration must be a number of seconds"),
         ("CAMERA_AFTER object=obj1 action=focus duration=-0.5", "duration cannot be negative"),
         ("CAMERA_AFTER object=obj1 action=focus hold=-0.1", "hold cannot be negative"),
+        ("CAMERA_AFTER object=obj1 action=focus return_duration=fast", "return_duration must be a number of seconds"),
+        ("CAMERA_AFTER object=obj1 action=focus return_duration=-0.3", "return_duration cannot be negative"),
+        ("CAMERA_AFTER object=obj1 action=focus return_duration=0", "return_duration must be positive"),
+        ("CAMERA_AFTER object=obj1 action=focus persist=maybe", "persist must be true or false"),
         ("CAMERA_AFTER object=obj1 action=focus framing=diagonal", "framing is invalid"),
         ("CAMERA_AFTER object=obj1 action=focus easing=bounce", "easing is invalid"),
         ("CAMERA_AFTER object=obj1 action=focus foo=bar", "unsupported parameter"),
