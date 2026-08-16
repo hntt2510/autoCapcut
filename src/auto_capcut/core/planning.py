@@ -48,13 +48,46 @@ def create_jobs(config: ProjectConfig) -> list[ProjectJob]:
 
 def resolve_timings(job: ProjectJob) -> tuple[list[ImageTiming], int]:
     audio_duration = probe_duration_us(job.audio_path)
-    if job.image_timing_srt:
+    effect_path = getattr(job.config, "main_effect_srt", None) or getattr(job.config, "effect_direction_srt", None)
+
+    # 1. Primary production timing source: Main Effect SRT
+    if effect_path is not None and Path(effect_path).is_file():
+        unified = parse_unified_effect(effect_path)
+        if len(unified.cues) != len(job.images):
+            raise ValidationError(f"Main Effect SRT mismatch: {len(job.images)} images / {len(unified.cues)} effect cues")
+        if not unified.cues:
+            raise ValidationError("Main Effect SRT contains no cues")
+        if unified.cues[0].start_us != 0:
+            raise ValidationError(f"Main Effect SRT error: First cue must start at 00:00:00,000, got {unified.cues[0].start_us / 1_000_000:.3f}s")
+
+        # Verify contiguous cues (no gaps or overlaps)
+        for c1, c2 in zip(unified.cues, unified.cues[1:]):
+            if c1.end_us != c2.start_us:
+                raise ValidationError(
+                    f"Main Effect SRT error: Gap or overlap between cue {c1.index} ({c1.end_us / 1_000_000:.3f}s) and cue {c2.index} ({c2.start_us / 1_000_000:.3f}s)"
+                )
+
+        # Validate final end against audio duration
+        final_end_us = unified.cues[-1].end_us
+        if abs(final_end_us - audio_duration) > TIMING_TOLERANCE_US:
+            raise ValidationError(
+                f"Main Effect SRT / audio duration mismatch: effect ends at {final_end_us / 1_000_000:.3f}s, audio is {audio_duration / 1_000_000:.3f}s"
+            )
+
+        timings = [ImageTiming(i, cue.start_us, cue.end_us) for i, cue in enumerate(unified.cues)]
+        return timings, final_end_us
+
+    # 2. Legacy fallback: image_timing_srt if passed
+    if job.image_timing_srt and Path(job.image_timing_srt).is_file():
         timings = parse_image_timing_srt(job.image_timing_srt)
         ranges = calculate_ranges(len(job.images), timings[-1].end_us, timings)
         if abs(ranges[-1].end_us - audio_duration) > TIMING_TOLERANCE_US:
             raise ValidationError(f"Image timing/audio mismatch: timing ends at {ranges[-1].end_us / 1_000_000:.3f}s, audio is {audio_duration / 1_000_000:.3f}s")
         return ranges, ranges[-1].end_us
+
+    # 3. Audio-only fallback without effect file: equal division
     return calculate_ranges(len(job.images), audio_duration), audio_duration
+
 
 
 def resolve_effect_directions(job: ProjectJob, timings: list[ImageTiming]) -> list[EffectCue | None] | None:

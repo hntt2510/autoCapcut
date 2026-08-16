@@ -448,3 +448,111 @@ def test_all_six_post_motion_presets_evaluated_in_buffer(tmp_path: Path, preset:
         assert cam_end.viewport[2] <= 1.0
     elif preset in {"subtle_pan_left", "subtle_pan_right"}:
         assert cam_end.viewport[0] != 0.0 or cam_end.viewport[1] != 0.0 or cam_end.viewport[2] != 1.0
+
+
+def test_resolve_timings_asymmetric_main_effect_srt(tmp_path: Path) -> None:
+    from auto_capcut.core.planning import resolve_timings
+    import wave
+
+    img1 = _make_dummy_image(tmp_path / "001.png")
+    img2 = _make_dummy_image(tmp_path / "002.png")
+    img3 = _make_dummy_image(tmp_path / "003.png")
+
+    srt_path = tmp_path / "main_effect.srt"
+    srt_path.write_text(
+        "1\n00:00:00,000 --> 00:00:03,000\nMODE basic_draw\n\n"
+        "2\n00:00:03,000 --> 00:00:11,000\nMODE basic_draw\n\n"
+        "3\n00:00:11,000 --> 00:00:15,000\nMODE basic_draw\n\n",
+        encoding="utf-8",
+    )
+
+    audio_path = tmp_path / "audio.wav"
+    with wave.open(str(audio_path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(16000)
+        wf.writeframes(b"\x00\x00" * 16000 * 15)
+
+    config = ProjectConfig(
+        project_name="TestAsym",
+        image_folders=[tmp_path],
+        audio_path=audio_path,
+        effect_direction_srt=srt_path,
+    )
+    job = ProjectJob(
+        name="TestAsym",
+        images=(img1, img2, img3),
+        audio_path=audio_path,
+        subtitle_srt=None,
+        image_timing_srt=None,
+        config=config,
+    )
+
+    timings, total_us = resolve_timings(job)
+    assert total_us == 15_000_000
+    assert len(timings) == 3
+    assert timings[0].start_us == 0 and timings[0].end_us == 3_000_000 and timings[0].duration_us == 3_000_000
+    assert timings[1].start_us == 3_000_000 and timings[1].end_us == 11_000_000 and timings[1].duration_us == 8_000_000
+    assert timings[2].start_us == 11_000_000 and timings[2].end_us == 15_000_000 and timings[2].duration_us == 4_000_000
+
+
+def test_resolve_timings_validations(tmp_path: Path) -> None:
+    from auto_capcut.core.planning import resolve_timings
+    from auto_capcut.core.errors import ValidationError
+    import wave
+
+    img1 = _make_dummy_image(tmp_path / "001.png")
+    img2 = _make_dummy_image(tmp_path / "002.png")
+
+    audio_path = tmp_path / "audio.wav"
+    with wave.open(str(audio_path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(16000)
+        wf.writeframes(b"\x00\x00" * 16000 * 10)
+
+    # 1. Cue count mismatch (3 cues for 2 images)
+    srt_mismatch = tmp_path / "mismatch.srt"
+    srt_mismatch.write_text(
+        "1\n00:00:00,000 --> 00:00:03,000\nMODE basic_draw\n\n"
+        "2\n00:00:03,000 --> 00:00:06,000\nMODE basic_draw\n\n"
+        "3\n00:00:06,000 --> 00:00:10,000\nMODE basic_draw\n\n",
+        encoding="utf-8",
+    )
+    job_mismatch = ProjectJob("test", (img1, img2), audio_path, None, None, ProjectConfig(effect_direction_srt=srt_mismatch))
+    with pytest.raises(ValidationError, match="Main Effect SRT mismatch"):
+        resolve_timings(job_mismatch)
+
+    # 2. Non-zero start (starts at 1s)
+    srt_nonzero = tmp_path / "nonzero.srt"
+    srt_nonzero.write_text(
+        "1\n00:00:01,000 --> 00:00:05,000\nMODE basic_draw\n\n"
+        "2\n00:00:05,000 --> 00:00:10,000\nMODE basic_draw\n\n",
+        encoding="utf-8",
+    )
+    job_nonzero = ProjectJob("test", (img1, img2), audio_path, None, None, ProjectConfig(effect_direction_srt=srt_nonzero))
+    with pytest.raises(ValidationError, match="First cue must start at 00:00:00,000"):
+        resolve_timings(job_nonzero)
+
+    # 3. Gap between cues (0-4s and 5-10s)
+    srt_gap = tmp_path / "gap.srt"
+    srt_gap.write_text(
+        "1\n00:00:00,000 --> 00:00:04,000\nMODE basic_draw\n\n"
+        "2\n00:00:05,000 --> 00:00:10,000\nMODE basic_draw\n\n",
+        encoding="utf-8",
+    )
+    job_gap = ProjectJob("test", (img1, img2), audio_path, None, None, ProjectConfig(effect_direction_srt=srt_gap))
+    with pytest.raises(ValidationError, match="Gap or overlap between cue 1"):
+        resolve_timings(job_gap)
+
+    # 4. Total duration mismatch vs audio (SRT ends at 8s, audio is 10s)
+    srt_dur = tmp_path / "dur.srt"
+    srt_dur.write_text(
+        "1\n00:00:00,000 --> 00:00:04,000\nMODE basic_draw\n\n"
+        "2\n00:00:04,000 --> 00:00:08,000\nMODE basic_draw\n\n",
+        encoding="utf-8",
+    )
+    job_dur = ProjectJob("test", (img1, img2), audio_path, None, None, ProjectConfig(effect_direction_srt=srt_dur))
+    with pytest.raises(ValidationError, match="Main Effect SRT / audio duration mismatch"):
+        resolve_timings(job_dur)
+

@@ -92,12 +92,10 @@ def validate_config_paths(config: ProjectConfig) -> None:
             raise ValidationError("No supported audio files found")
     if config.import_subtitles and audio_mode == "single" and config.subtitle_srt and not config.subtitle_srt.is_file():
         raise ValidationError("Subtitle SRT does not exist")
-    if config.use_image_timing and (config.image_timing_srt is None or not config.image_timing_srt.is_file()):
+    if getattr(config, "use_image_timing", False) and (getattr(config, "image_timing_srt", None) is None or not Path(config.image_timing_srt).is_file()):
         raise ValidationError("Image Timing SRT does not exist")
-    motion_mode = str(getattr(config, "motion_mode", "")).casefold()
-    if config.motion_enabled and motion_mode == "effect direction srt":
-        if config.effect_direction_srt is None or not config.effect_direction_srt.is_file():
-            raise ValidationError("Effect Direction SRT does not exist")
+    if config.effect_direction_srt is not None and not Path(config.effect_direction_srt).is_file():
+        raise ValidationError("Main Effect SRT does not exist")
     if config.logo_enabled and (config.logo_path is None or not config.logo_path.is_file()):
         raise ValidationError("Logo file is invalid")
     if config.music_enabled and (config.music_folder is None or not config.music_folder.is_dir()):

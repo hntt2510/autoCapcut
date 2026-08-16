@@ -1,4 +1,4 @@
-﻿"""
+"""
 G07 — Full CapCut draft E2E reliability smoke test.
 
 Covers:
@@ -46,28 +46,28 @@ def _make_wav(path, duration_seconds=15.0, sample_rate=22050):
 
 def _make_subtitle_srt(path):
     path.write_text(
-        "1\n00:00:00,000 --> 00:00:05,000\nFirst slide narration.\n\n"
-        "2\n00:00:05,000 --> 00:00:10,000\nDraw animation in progress.\n\n"
-        "3\n00:00:10,000 --> 00:00:15,000\nFinal slide summary.\n\n",
+        "1\n00:00:00,000 --> 00:00:03,000\nFirst slide narration.\n\n"
+        "2\n00:00:03,000 --> 00:00:11,000\nDraw animation in progress.\n\n"
+        "3\n00:00:11,000 --> 00:00:15,000\nFinal slide summary.\n\n",
         encoding="utf-8",
     )
     return path
 
 
 def _make_main_effect_srt(path):
-    """3 cues: cue1=basic_draw(0-5s), cue2=advanced_draw(5-10s), cue3=basic_draw(10-15s)."""
+    """3 asymmetric cues: cue1=3s (0-3s), cue2=8s (3-11s), cue3=4s (11-15s). Total=15s."""
     path.write_text(
-        "1\n00:00:00,000 --> 00:00:05,000\n"
+        "1\n00:00:00,000 --> 00:00:03,000\n"
         "MODE=basic_draw\nSTYLE=v1\n"
-        "COMPLETE_BEFORE_END 1.5s\nPOST_MOTION subtle_zoom_in\n"
-        "DRAW 0s-3.5s:\n\n"
-        "2\n00:00:05,000 --> 00:00:10,000\n"
+        "COMPLETE_BEFORE_END 1.0s\nPOST_MOTION subtle_zoom_in\n"
+        "DRAW 0s-2.0s:\n\n"
+        "2\n00:00:03,000 --> 00:00:11,000\n"
         "MODE=advanced_draw\nSTYLE=v1\n"
         "OBJECT_EFFECT target=obj_1 effect=draw\n"
-        "DRAW 0s-5s:\n\n"
-        "3\n00:00:10,000 --> 00:00:15,000\n"
+        "DRAW 0s-8.0s:\n\n"
+        "3\n00:00:11,000 --> 00:00:15,000\n"
         "MODE=basic_draw\nSTYLE=v1\n"
-        "DRAW 0s-5s:\n\n",
+        "DRAW 0s-4.0s:\n\n",
         encoding="utf-8",
     )
     return path
@@ -83,7 +83,7 @@ def _make_scene_json(path, img2):
 
 @pytest.mark.slow
 def test_g07_full_feature_e2e_smoke(tmp_path):
-    """G07: Full E2E smoke — 3 images, main effect SRT, audio, subtitles, logo, BGM, transitions."""
+    """G07: Full E2E smoke with asymmetric cue timings (3s, 8s, 4s) ensuring Main Effect SRT drives timeline."""
 
     img_dir = tmp_path / "images"
     img_dir.mkdir()
@@ -154,7 +154,7 @@ def test_g07_full_feature_e2e_smoke(tmp_path):
     tracks = content.get("tracks", [])
     track_names = [t.get("name", "") for t in tracks]
 
-    # Images track: 3 draw MP4 segments
+    # Images track: 3 draw MP4 segments with asymmetric timings
     images_track = next((t for t in tracks if t.get("name") == "Images"), None)
     assert images_track is not None, f"Images track missing. Got: {track_names}"
     segments = images_track.get("segments", [])
@@ -163,12 +163,17 @@ def test_g07_full_feature_e2e_smoke(tmp_path):
     videos = content.get("materials", {}).get("videos", [])
     video_map = {v["id"]: v.get("path", "") for v in videos}
 
-    expected_timings = [(0, 5_000_000), (5_000_000, 5_000_000), (10_000_000, 5_000_000)]
+    # Asymmetric timings: 0-3s (3s), 3-11s (8s), 11-15s (4s)
+    expected_timings = [
+        (0, 3_000_000),
+        (3_000_000, 8_000_000),
+        (11_000_000, 4_000_000),
+    ]
     for i, (seg, (expected_start, expected_dur)) in enumerate(zip(segments, expected_timings), 1):
         mat = video_map.get(seg.get("material_id"), "")
         assert mat.endswith(".mp4"), f"Cue{i} must be draw MP4, got: {mat}"
-        assert seg["target_timerange"]["start"] == expected_start, f"Cue{i} start mismatch"
-        assert seg["target_timerange"]["duration"] == expected_dur, f"Cue{i} duration mismatch"
+        assert seg["target_timerange"]["start"] == expected_start, f"Cue{i} start mismatch: expected {expected_start}, got {seg['target_timerange']['start']}"
+        assert seg["target_timerange"]["duration"] == expected_dur, f"Cue{i} duration mismatch: expected {expected_dur}, got {seg['target_timerange']['duration']}"
         assert len(seg.get("keyframe_list", [])) == 0, f"Cue{i} draw clip must not have camera keyframes"
         mp4 = Path(mat)
         assert mp4.is_file(), f"Draw MP4 for cue{i} not found at {mp4}"
@@ -176,6 +181,7 @@ def test_g07_full_feature_e2e_smoke(tmp_path):
         assert abs(actual_us - expected_dur) <= 70_000, (
             f"Draw MP4 cue{i} duration: expected {expected_dur}us, got {actual_us}us"
         )
+
 
     # Audio
     audio_track = next((t for t in tracks if t.get("name") == "Main Audio"), None)

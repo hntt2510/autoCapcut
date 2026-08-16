@@ -67,11 +67,7 @@ class MainWindow(QMainWindow):
         image_buttons.addWidget(add_images); image_buttons.addWidget(remove_images); image_layout.addLayout(image_buttons)
         self.image_count = QLabel("Number of images: 0"); image_layout.addWidget(self.image_count); layout.addWidget(images)
 
-        # IMAGE TIMING SRT is legacy/advanced only — hidden from normal production UI.
-        # Fields retained as hidden widgets so settings serialization still works.
-        self.use_timing = QCheckBox("Use Image Timing SRT")
-        self.timing_path = QLineEdit()
-
+        # Audio
         audio = QGroupBox("AUDIO"); audio_layout = QVBoxLayout(audio); mode_row = QHBoxLayout()
         self.single_audio = QRadioButton("Single Audio"); self.folder_audio = QRadioButton("Audio Folder"); self.single_audio.setChecked(True)
         mode_row.addWidget(self.single_audio); mode_row.addWidget(self.folder_audio); audio_layout.addLayout(mode_row)
@@ -87,12 +83,9 @@ class MainWindow(QMainWindow):
         self.motion_mode = QComboBox(); self.motion_mode.addItems(["None", "Random Light", "Subtle Zoom In", "Subtle Zoom Out", "Subtle Pan Left", "Subtle Pan Right"])
         self.effect_path = QLineEdit(); effect_browse = QPushButton("Browse"); effect_browse.clicked.connect(lambda: self._browse_file(self.effect_path, "SRT files (*.srt)")); effect_row = QHBoxLayout(); effect_row.addWidget(self.effect_path); effect_row.addWidget(effect_browse)
         self.effect_status = QLabel("Effect status: not selected"); self.effect_status.setWordWrap(True)
-        self.roi_status = QLabel("Camera Frame status: not selected"); self.roi_status.setWordWrap(True)
-        self.edit_roi_button = QPushButton("Edit Camera Frames"); self.edit_roi_button.clicked.connect(self._edit_roi)
         self.motion_strength = QComboBox(); self.motion_strength.addItems([strength.value for strength in MotionStrength])
         motion_form.addRow(self.motion_enabled); motion_form.addRow("Post-draw motion", self.motion_mode); motion_form.addRow("Main Effect SRT", effect_row)
-        motion_form.addRow("Effect status", self.effect_status); motion_form.addRow("Camera Frame status", self.roi_status); motion_form.addRow(self.edit_roi_button); motion_form.addRow("Motion strength", self.motion_strength); layout.addWidget(motion)
-
+        motion_form.addRow("Effect status", self.effect_status); motion_form.addRow("Motion strength", self.motion_strength); layout.addWidget(motion)
 
         transitions = QGroupBox("TRANSITIONS"); transition_form = QFormLayout(transitions); self.transition_enabled = QCheckBox("Enable Transitions"); self.transition_enabled.setChecked(True); self.transition_type = QComboBox(); self.transition_type.addItem("Blur"); self.transition_duration = QDoubleSpinBox(); self.transition_duration.setRange(0.01, 5.0); self.transition_duration.setSingleStep(0.05); self.transition_duration.setValue(0.30)
         transition_form.addRow(self.transition_enabled); transition_form.addRow("Transition", self.transition_type); transition_form.addRow("Duration (s)", self.transition_duration); layout.addWidget(transitions)
@@ -101,10 +94,11 @@ class MainWindow(QMainWindow):
         music = QGroupBox("BACKGROUND MUSIC"); music_form = QFormLayout(music); self.music_enabled = QCheckBox("Add Background Music"); self.music_path = QLineEdit(); music_browse = QPushButton("Browse"); music_browse.clicked.connect(lambda: self._browse_folder(self.music_path)); music_row = QHBoxLayout(); music_row.addWidget(self.music_path); music_row.addWidget(music_browse); self.music_volume = QSlider(Qt.Orientation.Horizontal); self.music_volume.setRange(0, 100); self.music_volume.setValue(15); music_form.addRow(self.music_enabled); music_form.addRow("Music folder", music_row); music_form.addRow("Volume", self.music_volume); layout.addWidget(music)
         output = QGroupBox("OUTPUT"); output_form = QFormLayout(output); self.draft_path = QLineEdit(str(default_draft_folder())); draft_browse = QPushButton("Browse"); draft_browse.clicked.connect(lambda: self._browse_folder(self.draft_path)); draft_row = QHBoxLayout(); draft_row.addWidget(self.draft_path); draft_row.addWidget(draft_browse); output_form.addRow("CapCut Draft Folder", draft_row); layout.addWidget(output)
         self.create_button = QPushButton("CREATE CAPCUT PROJECT"); self.create_button.setMinimumHeight(42); self.create_button.clicked.connect(self._create_project); layout.addWidget(self.create_button); self.progress = QProgressBar(); self.status = QLabel("Ready"); self.status.setWordWrap(True); layout.addWidget(self.progress); layout.addWidget(self.status)
-        for widget in (self.use_timing, self.import_subtitles, self.motion_enabled, self.transition_enabled, self.logo_enabled, self.music_enabled, self.single_audio, self.folder_audio): widget.toggled.connect(self._update_enabled)
+        for widget in (self.import_subtitles, self.motion_enabled, self.transition_enabled, self.logo_enabled, self.music_enabled, self.single_audio, self.folder_audio): widget.toggled.connect(self._update_enabled)
         self.motion_mode.currentTextChanged.connect(lambda *_: (self._update_enabled(), self._update_effect_status()))
         self.effect_path.textChanged.connect(lambda *_: (self._update_enabled(), self._update_effect_status()))
         self.image_list.model().rowsInserted.connect(lambda *_: self._image_list_changed()); self.image_list.model().rowsRemoved.connect(lambda *_: self._image_list_changed())
+
 
         # ── DRAW ANIMATION group ──────────────────────────────────────────
         draw_grp = QGroupBox("DRAW ANIMATION")
@@ -282,8 +276,7 @@ class MainWindow(QMainWindow):
     def _update_effect_status(self) -> None:
         path = Path(self.effect_path.text()) if self.effect_path.text() else None
         if path is None or not path.is_file():
-            self.effect_status.setText("Effect status: choose an Effect Direction SRT")
-            self.roi_status.setText("Camera Frame status: not selected")
+            self.effect_status.setText("Effect status: choose a Main Effect SRT")
             return
         try:
             from auto_capcut.core.unified_effect_parser import parse_unified_effect
@@ -291,62 +284,14 @@ class MainWindow(QMainWindow):
             images = self._current_images()
             total_cues = len(unified.cues)
             draw_count = len(unified.draw_plans)
-            cue_label = f"{total_cues} cues ({draw_count} draw)" if draw_count else f"{total_cues} effect cues"
+            cue_label = f"{total_cues} cues ({draw_count} draw)" if draw_count else f"{total_cues} cues"
             self.effect_status.setText(f"{len(images)} images / {cue_label} {'✓' if len(images) == total_cues else '!'}")
-            effects = [c.effect_cue for c in unified.cues if c.kind == "standard" and c.effect_cue is not None]
-            targets = required_roi_targets(effects)
-            resolver = ManualRoiResolver(roi_sidecar_path(path))
-            configured = 0
-            reframing = 0
-            resolution = RESOLUTIONS[self.resolution.currentText()]
-            for target in targets:
-                if target.image_index > len(images):
-                    continue
-                valid, reason = validate_saved_frame(resolver.resolve(images[target.image_index - 1], target.target_id, target.image_index), images[target.image_index - 1], (resolution.width, resolution.height)) if resolver.resolve(images[target.image_index - 1], target.target_id, target.image_index) else (False, "missing")
-                configured += int(valid)
-                reframing += int(not valid and reason == "frame aspect does not match project canvas")
-            missing = len(targets) - configured
-            if not targets:
-                self.roi_status.setText("Camera Frame status: ready ✓ (No camera frames required)" if draw_count else "Camera Frame status: 0 / 0 ready ✓")
-            elif missing == 0:
-                self.roi_status.setText(f"Camera Frame status: {configured} / {len(targets)} ready ✓")
-            else:
-                suffix = f"\n{reframing} needs reframing" if reframing else ""
-                self.roi_status.setText(f"Camera Frame status: {len(targets)} targets / {configured} configured\n{missing} missing{suffix}")
         except Exception as exc:
             self.effect_status.setText(f"Effect status: {exc}")
-            self.roi_status.setText("Camera Frame status: invalid Effect Direction")
-
-    def _edit_roi(self) -> None:
-        path = Path(self.effect_path.text()) if self.effect_path.text() else None
-        images = self._current_images()
-        if path is None or not path.is_file():
-            QMessageBox.warning(self, "Camera Frames", "Choose a valid Effect Direction SRT first.")
-            return
-        try:
-            from auto_capcut.core.unified_effect_parser import parse_unified_effect
-            unified = parse_unified_effect(path)
-            effects = [c.effect_cue for c in unified.cues if c.kind == "standard" and c.effect_cue is not None]
-            if not effects:
-                QMessageBox.information(self, "Camera Frames", "No standard camera frames in the selected effect file.")
-                return
-        except Exception as exc:
-            QMessageBox.critical(self, "Camera Frames", str(exc))
-            return
-        resolution = RESOLUTIONS[self.resolution.currentText()]
-        dialog = RoiEditorDialog(images, effects, roi_sidecar_path(path), self, (resolution.width, resolution.height), self.motion_strength.currentText())
-        dialog.exec()
-        self._update_effect_status()
-
-
-    def _show_missing_roi_editor(self) -> None:
-        """Open the same project-wide queue used by the ROI button."""
-        self._edit_roi()
 
     def _update_enabled(self) -> None:
         self.motion_mode.setEnabled(self.motion_enabled.isChecked())
         self.effect_path.setEnabled(True)
-        self.edit_roi_button.setEnabled(Path(self.effect_path.text()).is_file() and bool(self._current_images()))
         self.motion_strength.setEnabled(self.motion_enabled.isChecked())
         self.transition_type.setEnabled(self.transition_enabled.isChecked())
         self.transition_duration.setEnabled(self.transition_enabled.isChecked())
@@ -354,8 +299,6 @@ class MainWindow(QMainWindow):
         draw_on = self.draw_enabled.isChecked()
         for w in (self.draw_source_label, self.draw_scene_path, self.edit_draw_objects_btn, self.draw_scene_status, self.draw_remove_bg, self.draw_fallback_basic, self.draw_diagnostics, self.draw_reuse_cache):
             w.setEnabled(draw_on)
-
-
 
     def _config(self) -> ProjectConfig:
         return ProjectConfig(
@@ -366,8 +309,6 @@ class MainWindow(QMainWindow):
             audio_path=Path(self.audio_path.text()) if self.audio_path.text() else None,
             subtitle_srt=Path(self.subtitle_path.text()) if self.subtitle_path.text() else None,
             import_subtitles=self.import_subtitles.isChecked(),
-            use_image_timing=self.use_timing.isChecked(),
-            image_timing_srt=Path(self.timing_path.text()) if self.timing_path.text() else None,
             motion_enabled=self.motion_enabled.isChecked(),
             motion_mode=self.motion_mode.currentText(),
             motion_strength=self.motion_strength.currentText(),
@@ -383,7 +324,6 @@ class MainWindow(QMainWindow):
             draft_folder=Path(self.draft_path.text()) if self.draft_path.text() else None,
             # ── Draw Animation ──────────────────────────────────────────
             draw_enabled=self.draw_enabled.isChecked(),
-            draw_effect_srt=Path(self.draw_effect_path.text()) if self.draw_effect_path.text() else None,
             draw_scene_json=Path(self.draw_scene_path.text()) if self.draw_scene_path.text() else None,
             draw_remove_background=self.draw_remove_bg.isChecked(),
             draw_fallback_basic=self.draw_fallback_basic.isChecked(),
@@ -394,26 +334,18 @@ class MainWindow(QMainWindow):
     def _create_project(self) -> None:
         try: config = self._config()
         except Exception as exc: QMessageBox.critical(self, "Invalid configuration", str(exc)); return
-        self._save_settings(); self.create_button.setEnabled(False); self.progress.setValue(0); self.status.setText("Loading inputs..."); self.thread = QThread(self); self.worker = ProjectWorker(config); self.worker.moveToThread(self.thread); self.thread.started.connect(self.worker.run); self.worker.progress.connect(self._on_progress); self.worker.finished.connect(self._on_finished); self.worker.failed.connect(self._on_failed); self.worker.finished.connect(self.thread.quit); self.worker.failed.connect(self.thread.quit); self.thread.finished.connect(self._thread_finished); self.thread.start()
+        self.create_button.setEnabled(False); self.progress.setValue(0); self.status.setText("Starting...")
+        self.thread = QThread(); self.worker = ProjectWorker(config); self.worker.moveToThread(self.thread)
+        self.thread.started.connect(self.worker.run)
+        self.worker.progress.connect(lambda v, m: (self.progress.setValue(v), self.status.setText(m)))
+        self.worker.finished.connect(self._on_finished); self.worker.failed.connect(self._on_failed)
+        self.worker.finished.connect(self.thread.quit); self.worker.failed.connect(self.thread.quit)
+        self.thread.finished.connect(self._thread_finished)
+        self.thread.start()
 
-    def _on_progress(self, value: int, message: str) -> None: self.progress.setValue(value); self.status.setText(message)
     def _on_finished(self, results: list) -> None: self.progress.setValue(100); self.status.setText(f"Project created successfully: {', '.join(result.project_name for result in results)}")
     def _on_failed(self, message: str) -> None:
         self.status.setText(f"Error: {message}")
-        if message.startswith("Missing ROI definitions:"):
-            box = QMessageBox(self)
-            box.setIcon(QMessageBox.Icon.Warning)
-            box.setWindowTitle("Missing Target ROIs")
-            box.setText("Required target ROIs are missing. Configure them before creating the draft.")
-            details = QPushButton("View Missing Targets", box)
-            box.addButton(details, QMessageBox.ButtonRole.ActionRole)
-            edit = box.addButton("Edit Missing ROIs", QMessageBox.ButtonRole.AcceptRole)
-            box.addButton(QMessageBox.StandardButton.Close)
-            details.clicked.connect(lambda: box.setDetailedText(message))
-            box.exec()
-            if box.clickedButton() is edit:
-                self._show_missing_roi_editor()
-            return
         QMessageBox.critical(self, "Auto CapCut", message)
     def _thread_finished(self) -> None: self.create_button.setEnabled(True); self.thread = None; self.worker = None; self._update_enabled()
 
@@ -421,14 +353,13 @@ class MainWindow(QMainWindow):
         values = {
             "project_name": self.project_name.text(), "resolution": self.resolution.currentText(),
             "audio_path": self.audio_path.text(), "subtitle_path": self.subtitle_path.text(),
-            "timing_path": self.timing_path.text(), "logo_path": self.logo_path.text(),
-            "music_path": self.music_path.text(), "draft_path": self.draft_path.text(),
-            "motion_enabled": self.motion_enabled.isChecked(), "transition_enabled": self.transition_enabled.isChecked(),
+            "logo_path": self.logo_path.text(), "music_path": self.music_path.text(),
+            "draft_path": self.draft_path.text(), "motion_enabled": self.motion_enabled.isChecked(),
+            "transition_enabled": self.transition_enabled.isChecked(),
             "effect_path": self.effect_path.text(), "motion_mode": self.motion_mode.currentText(),
             "motion_strength": self.motion_strength.currentText(),
             # Draw Animation settings
             "draw_enabled": self.draw_enabled.isChecked(),
-            "draw_effect_path": self.draw_effect_path.text(),
             "draw_scene_path": self.draw_scene_path.text(),
             "draw_remove_bg": self.draw_remove_bg.isChecked(),
             "draw_fallback_basic": self.draw_fallback_basic.isChecked(),
@@ -439,21 +370,19 @@ class MainWindow(QMainWindow):
         if self.image_list.count(): self.settings.setValue("image_folder", self.image_list.item(0).text())
 
     def _load_settings(self) -> None:
-        # One-time cleanup for settings written by removed Asset/Vision UI.
         self.settings.remove("asset_folder")
         self.settings.remove("visual_manifest_path")
+        self.settings.remove("timing_path")
+        self.settings.remove("draw_effect_path")
         self.project_name.setText(self.settings.value("project_name", "")); resolution = self.settings.value("resolution", "1920x1080"); index = self.resolution.findText(str(resolution)); self.resolution.setCurrentIndex(index if index >= 0 else 0)
-        for key, widget in (("audio_path", self.audio_path), ("subtitle_path", self.subtitle_path), ("timing_path", self.timing_path), ("logo_path", self.logo_path), ("music_path", self.music_path), ("draft_path", self.draft_path)): widget.setText(str(self.settings.value(key, widget.text())))
+        for key, widget in (("audio_path", self.audio_path), ("subtitle_path", self.subtitle_path), ("logo_path", self.logo_path), ("music_path", self.music_path), ("draft_path", self.draft_path)): widget.setText(str(self.settings.value(key, widget.text())))
         self.effect_path.setText(str(self.settings.value("effect_path", ""))); saved_mode = str(self.settings.value("motion_mode", "Random Light")); legacy = {"Random": "Random Light", "Zoom In": "Subtle Zoom In", "Zoom Out": "Subtle Zoom Out", "Pan Left": "Subtle Pan Left", "Pan Right": "Subtle Pan Right"}; saved_mode = legacy.get(saved_mode, saved_mode); self.motion_mode.setCurrentText(saved_mode if self.motion_mode.findText(saved_mode) >= 0 else "Random Light"); self.motion_strength.setCurrentText(str(self.settings.value("motion_strength", MotionStrength.SUBTLE.value))); self.motion_enabled.setChecked(self.settings.value("motion_enabled", True, type=bool)); self.transition_enabled.setChecked(self.settings.value("transition_enabled", True, type=bool)); image_folder = str(self.settings.value("image_folder", ""));
         if image_folder: self.image_list.addItem(image_folder); self._image_list_changed()
         # Draw Animation settings
         self.draw_enabled.setChecked(self.settings.value("draw_enabled", True, type=bool))
-        self.draw_effect_path.setText(str(self.settings.value("draw_effect_path", "")))
-
         self.draw_scene_path.setText(str(self.settings.value("draw_scene_path", "")))
         self.draw_remove_bg.setChecked(self.settings.value("draw_remove_bg", False, type=bool))
         self.draw_fallback_basic.setChecked(self.settings.value("draw_fallback_basic", True, type=bool))
         self.draw_diagnostics.setChecked(self.settings.value("draw_diagnostics", False, type=bool))
         self.draw_reuse_cache.setChecked(self.settings.value("draw_reuse_cache", True, type=bool))
         self._update_draw_scene_status()
-
