@@ -11,11 +11,6 @@ from auto_capcut.core.errors import ValidationError
 from auto_capcut.core.media import AUDIO_EXTENSIONS, probe_duration_us
 from auto_capcut.core.motion_engine import MotionEngine
 from auto_capcut.core.alert_overlay import create_alert_overlay
-from auto_capcut.core.captured_effect_template import (
-    CapturedEffectTemplateCloner,
-    CapturedEffectTemplateRepository,
-    ResolvedCapturedEffectPreset,
-)
 from auto_capcut.core.planning import resolve_effect_directions, resolve_timings, validate_required_rois
 from auto_capcut.core.roi_resolver import ManualRoiResolver, roi_sidecar_path
 from auto_capcut.core.srt_parser import parse_srt
@@ -31,7 +26,6 @@ class CapCutBuilder:
         except ImportError as exc:  # pragma: no cover - exercised in packaging/runtime
             raise ValidationError("pycapcut is not installed. Run pip install -e .") from exc
         self.cc = cc
-        self.effect_templates = CapturedEffectTemplateRepository()
 
     def build_job(self, job: ProjectJob, progress_callback: ProgressCallback | None = None) -> BuildResult:
         cc = self.cc
@@ -54,7 +48,6 @@ class CapCutBuilder:
             draw_clips = self._render_draw_clips(job, timings, progress, warnings)
         # ──────────────────────────────────────────────────────────────────
 
-        captured_effects, captured_keys = self._resolve_captured_effects(effects, timings, warnings)
         validate_required_rois(job, effects)
         progress(25, "Creating CapCut Draft...")
         final_name = unique_project_name(draft_root, job.name)
@@ -63,16 +56,16 @@ class CapCutBuilder:
         try:
             draft_folder = cc.DraftFolder(str(staging_parent))
             script = draft_folder.create_draft(staging_name, job.config.resolution.width, job.config.resolution.height, fps=30)
-            fallback_alerts = bool(effects and any(
-                effect.type == "ALERT" and (cue_index, effect_index) not in captured_keys
-                for cue_index, cue in enumerate(effects)
+            has_alert_overlays = bool(effects and any(
+                effect.type == "ALERT"
+                for cue in effects
                 if cue is not None
-                for effect_index, effect in enumerate(cue.effects)
+                for effect in cue.effects
             ))
 
-            self._add_tracks(script, fallback_alerts)
+            self._add_tracks(script, has_alert_overlays)
             progress(35, "Adding images...")
-            self._add_images(script, job, timings, warnings, effects, captured_keys, draw_clips)
+            self._add_images(script, job, timings, warnings, effects, draw_clips)
             progress(58, "Applying motion and transitions...")
             # Motion/transitions are attached while image segments are created.
             progress(67, "Adding main audio...")
@@ -89,14 +82,6 @@ class CapCutBuilder:
             progress(93, "Saving project...")
             script.save()
             staging_project = staging_parent / staging_name
-            for preset, effect_start_us, effect_duration_us in captured_effects:
-                CapturedEffectTemplateCloner.inject_file(
-                    staging_project,
-                    preset,
-                    start_us=effect_start_us,
-                    duration_us=effect_duration_us,
-                    track_name="Captured Effects",
-                )
             validate_draft_json(staging_project, duration_us)
             destination = draft_root / final_name
             staging_project.replace(destination)
@@ -125,9 +110,10 @@ class CapCutBuilder:
         if warning_overlays:
             script.add_track(cc.TrackType.video, "Warning Overlays", absolute_index=25)
 
-    def _add_images(self, script, job: ProjectJob, timings: list[ImageTiming], warnings: list[str], effects=None, captured_keys=frozenset(), draw_clips: dict[int, Path] | None = None) -> None:
+    def _add_images(self, script, job: ProjectJob, timings: list[ImageTiming], warnings: list[str], effects=None, draw_clips: dict[int, Path] | None = None) -> None:
         cc = self.cc
-        manual_resolver = ManualRoiResolver(roi_sidecar_path(job.config.effect_direction_srt)) if effects and job.config.effect_direction_srt else None
+        main_srt = getattr(job.config, 'main_effect_srt', job.config.effect_direction_srt)
+        manual_resolver = ManualRoiResolver(roi_sidecar_path(main_srt)) if effects and main_srt else None
         roi_resolver = manual_resolver
         engine = MotionEngine(job.config.resolution.width, job.config.resolution.height, job.config.motion_strength, roi_resolver)
         for index, (image_path, timing) in enumerate(zip(job.images, timings)):
@@ -173,7 +159,7 @@ class CapCutBuilder:
             if plan:
                 self._apply_motion_plan(segment, plan, base_scale)
             if effects and effects[index] is not None:
-                self._add_alert_overlays(script, effects[index], image_path, timing, job, base_scale, plan, manual_resolver, index, captured_keys)
+                self._add_alert_overlays(script, effects[index], image_path, timing, job, base_scale, plan, manual_resolver, index)
             if job.config.transition_enabled and index < len(job.images) - 1:
                 self._maybe_add_transition(segment, effects[index] if effects else None, timing, timings[index + 1], job, warnings, index)
             script.add_segment(segment, "Images")
@@ -204,8 +190,8 @@ class CapCutBuilder:
         import logging
         logger = logging.getLogger(__name__)
 
-        # Determine which SRT to parse for draw cues
-        draw_srt = job.config.draw_effect_srt or job.config.effect_direction_srt
+        # Production draw rendering always uses effect_direction_srt (single-effect production contract)
+        draw_srt = job.config.effect_direction_srt
         if draw_srt is None or not draw_srt.is_file():
             return {}
 
@@ -215,6 +201,7 @@ class CapCutBuilder:
 
         # Map cue index (1-based) to 0-based image index, then filter draw cues
         draw_plans_by_img: dict[int, object] = {}   # {0-based image index -> DrawImagePlan}
+
         draw_indexes: list[int] = []
         for cue in unified.cues:
             img_idx = cue.index - 1  # 0-based
@@ -320,7 +307,7 @@ class CapCutBuilder:
             if has_y:
                 segment.add_keyframe(cc.KeyframeProperty.position_y, offset, transform.position_y)
 
-    def _add_alert_overlays(self, script, cue, image_path: Path, timing: ImageTiming, job: ProjectJob, base_scale: float, plan, resolver, cue_index: int = 0, captured_keys=frozenset()) -> None:
+    def _add_alert_overlays(self, script, cue, image_path: Path, timing: ImageTiming, job: ProjectJob, base_scale: float, plan, resolver, cue_index: int = 0) -> None:
         if resolver is None:
             return
         cc = self.cc
@@ -329,12 +316,11 @@ class CapCutBuilder:
                 continue
             if effect.params.get("preset", "").strip():
                 continue
-            if (cue_index, effect_index) in captured_keys:
-                continue
             roi = resolver.resolve(image_path, effect.target_id, cue.image_index)
             if roi is None:
                 continue
-            overlay_dir = job.config.effect_direction_srt.with_suffix(".overlays") if job.config.effect_direction_srt else image_path.parent / ".overlays"
+            _main_srt = getattr(job.config, 'main_effect_srt', job.config.effect_direction_srt)
+            overlay_dir = _main_srt.with_suffix(".overlays") if _main_srt else image_path.parent / ".overlays"
             overlay_path = create_alert_overlay(image_path, roi, effect, overlay_dir)
             material = cc.VideoMaterial(str(overlay_path))
             start = timing.start_us + effect.local_start_us
@@ -358,42 +344,7 @@ class CapCutBuilder:
             raise ValidationError(f"Effect SRT error: Image {image_index} {field} must be a time in seconds")
         return round(float(match.group(1)) * 1_000_000)
 
-    def _resolve_captured_effects(self, effects, timings: list[ImageTiming], warnings: list[str]):
-        resolved: list[tuple[ResolvedCapturedEffectPreset, int, int]] = []
-        keys: set[tuple[int, int]] = set()
-        unresolved: list[str] = []
-        if not effects:
-            return resolved, keys
-        for cue_index, (cue, timing) in enumerate(zip(effects, timings)):
-            if cue is None:
-                continue
-            for effect_index, effect in enumerate(cue.effects):
 
-                preset_name = effect.params.get("preset", "").strip()
-                if not preset_name:
-                    continue
-                if effect.type != "ALERT":
-                    unresolved.append(preset_name)
-                    continue
-                preset = self.effect_templates.resolve_effect_preset(preset_name)
-                if preset is None:
-                    unresolved.append(preset_name)
-                    continue
-                local_start = effect.local_start_us
-                local_end = effect.local_end_us
-                if "effect_start" in effect.params:
-                    local_start = self._effect_time(effect.params["effect_start"], image_index=cue.image_index, field="effect_start")
-                if "effect_end" in effect.params:
-                    local_end = self._effect_time(effect.params["effect_end"], image_index=cue.image_index, field="effect_end")
-                if local_start < effect.local_start_us or local_end > effect.local_end_us or local_end <= local_start:
-                    raise ValidationError(f"Effect SRT error: Image {cue.image_index} captured effect timing must be inside ALERT range")
-                resolved.append((preset, timing.start_us + local_start, local_end - local_start))
-                keys.add((cue_index, effect_index))
-        if unresolved:
-            unique = list(dict.fromkeys(unresolved))
-            lines = ["Unresolved CapCut effect presets:"] + [f"- {name}" for name in unique]
-            raise ValidationError("\n".join(lines))
-        return resolved, keys
 
     def _blur_transition_type(self):
         transition_type = getattr(self.cc.TransitionType, "转场_模糊", None)

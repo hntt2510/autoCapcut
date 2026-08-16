@@ -37,7 +37,7 @@ def test_main_window_draw_ui_elements_exist(qt_app: QApplication, tmp_path: Path
     assert window.edit_draw_objects_btn.text() == "Edit Draw Objects"
     assert hasattr(window, "draw_scene_status")
     assert hasattr(window, "draw_source_label")
-    assert window.draw_source_label.text() == "Uses main Effect Direction SRT"
+    assert window.draw_source_label.text() == "Uses Main Effect SRT (timing + draw mode source)"
     window.deleteLater()
 
 

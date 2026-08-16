@@ -7,7 +7,6 @@ from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
     QLabel, QLineEdit, QListWidget, QMainWindow, QMessageBox, QProgressBar,
     QPushButton, QRadioButton, QScrollArea, QSlider, QDoubleSpinBox, QVBoxLayout, QWidget,
-    QMenuBar,
     QTabWidget,
 )
 
@@ -32,20 +31,9 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(560, 760)
         self.resize(650, 900)
         self._build_ui()
-        self._build_tools_menu()
         self._load_settings()
         self._update_enabled()
 
-    def _build_tools_menu(self) -> None:
-        """Install isolated developer tools without touching project controls."""
-        tools_menu = self.menuBar().addMenu("Tools")
-        action = tools_menu.addAction("Effect Catalog Tester")
-        action.triggered.connect(self._open_effect_catalog)
-
-    def _open_effect_catalog(self) -> None:
-        from auto_capcut.ui.effect_catalog_dialog import EffectCatalogDialog
-        dialog = EffectCatalogDialog(self)
-        dialog.exec()
 
     def _build_ui(self) -> None:
         tabs = QTabWidget()
@@ -55,7 +43,7 @@ class MainWindow(QMainWindow):
         scroll.setWidgetResizable(True)
         scroll.setWidget(root)
         tabs.addTab(scroll, "CapCut Draft")
-        tabs.addTab(draw_tab, "Draw Animation")
+        tabs.addTab(draw_tab, "Draw Debug")
         self.setCentralWidget(tabs)
         layout = QVBoxLayout(root)
         layout.setContentsMargins(18, 14, 18, 18)
@@ -79,10 +67,10 @@ class MainWindow(QMainWindow):
         image_buttons.addWidget(add_images); image_buttons.addWidget(remove_images); image_layout.addLayout(image_buttons)
         self.image_count = QLabel("Number of images: 0"); image_layout.addWidget(self.image_count); layout.addWidget(images)
 
-        timing = QGroupBox("IMAGE TIMING")
-        timing_form = QFormLayout(timing); self.use_timing = QCheckBox("Use Image Timing SRT"); self.timing_path = QLineEdit(); timing_browse = QPushButton("Browse")
-        timing_browse.clicked.connect(lambda: self._browse_file(self.timing_path, "SRT files (*.srt)")); timing_row = QHBoxLayout(); timing_row.addWidget(self.timing_path); timing_row.addWidget(timing_browse)
-        timing_form.addRow(self.use_timing); timing_form.addRow("Image Timing SRT", timing_row); layout.addWidget(timing)
+        # IMAGE TIMING SRT is legacy/advanced only — hidden from normal production UI.
+        # Fields retained as hidden widgets so settings serialization still works.
+        self.use_timing = QCheckBox("Use Image Timing SRT")
+        self.timing_path = QLineEdit()
 
         audio = QGroupBox("AUDIO"); audio_layout = QVBoxLayout(audio); mode_row = QHBoxLayout()
         self.single_audio = QRadioButton("Single Audio"); self.folder_audio = QRadioButton("Audio Folder"); self.single_audio.setChecked(True)
@@ -94,7 +82,7 @@ class MainWindow(QMainWindow):
         subtitle_browse.clicked.connect(lambda: self._browse_file(self.subtitle_path, "SRT files (*.srt)")); subtitle_row = QHBoxLayout(); subtitle_row.addWidget(self.subtitle_path); subtitle_row.addWidget(subtitle_browse)
         subtitle_form.addRow(self.import_subtitles); subtitle_form.addRow("Subtitle SRT", subtitle_row); layout.addWidget(subtitles)
 
-        motion = QGroupBox("VISUAL EFFECTS"); motion_form = QFormLayout(motion)
+        motion = QGroupBox("MAIN EFFECT SRT & MOTION"); motion_form = QFormLayout(motion)
         self.motion_enabled = QCheckBox("Enable Visual Effects"); self.motion_enabled.setChecked(True)
         self.motion_mode = QComboBox(); self.motion_mode.addItems(["None", "Random Light", "Subtle Zoom In", "Subtle Zoom Out", "Subtle Pan Left", "Subtle Pan Right"])
         self.effect_path = QLineEdit(); effect_browse = QPushButton("Browse"); effect_browse.clicked.connect(lambda: self._browse_file(self.effect_path, "SRT files (*.srt)")); effect_row = QHBoxLayout(); effect_row.addWidget(self.effect_path); effect_row.addWidget(effect_browse)
@@ -102,7 +90,7 @@ class MainWindow(QMainWindow):
         self.roi_status = QLabel("Camera Frame status: not selected"); self.roi_status.setWordWrap(True)
         self.edit_roi_button = QPushButton("Edit Camera Frames"); self.edit_roi_button.clicked.connect(self._edit_roi)
         self.motion_strength = QComboBox(); self.motion_strength.addItems([strength.value for strength in MotionStrength])
-        motion_form.addRow(self.motion_enabled); motion_form.addRow("Post-draw motion", self.motion_mode); motion_form.addRow("Effect Direction SRT", effect_row)
+        motion_form.addRow(self.motion_enabled); motion_form.addRow("Post-draw motion", self.motion_mode); motion_form.addRow("Main Effect SRT", effect_row)
         motion_form.addRow("Effect status", self.effect_status); motion_form.addRow("Camera Frame status", self.roi_status); motion_form.addRow(self.edit_roi_button); motion_form.addRow("Motion strength", self.motion_strength); layout.addWidget(motion)
 
 
@@ -126,7 +114,7 @@ class MainWindow(QMainWindow):
         self.draw_enabled.setChecked(True)
         draw_form.addRow(self.draw_enabled)
 
-        self.draw_source_label = QLabel("Uses main Effect Direction SRT")
+        self.draw_source_label = QLabel("Uses Main Effect SRT (timing + draw mode source)")
         self.draw_source_label.setStyleSheet("color: #666; font-style: italic;")
         draw_form.addRow("Effect source:", self.draw_source_label)
 
@@ -412,13 +400,6 @@ class MainWindow(QMainWindow):
     def _on_finished(self, results: list) -> None: self.progress.setValue(100); self.status.setText(f"Project created successfully: {', '.join(result.project_name for result in results)}")
     def _on_failed(self, message: str) -> None:
         self.status.setText(f"Error: {message}")
-        if message.startswith("Unresolved CapCut effect presets:"):
-            presets = [line[2:].strip() for line in message.splitlines()[1:] if line.startswith("- ")]
-            images = self._current_images()
-            from auto_capcut.ui.effect_catalog_dialog import EffectCatalogDialog
-            dialog = EffectCatalogDialog(self, resolution_presets=presets, test_image_path=images[0] if images else None)
-            dialog.exec()
-            return
         if message.startswith("Missing ROI definitions:"):
             box = QMessageBox(self)
             box.setIcon(QMessageBox.Icon.Warning)

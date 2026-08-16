@@ -17,7 +17,6 @@ from auto_capcut.core.roi_resolver import ManualRoiResolver, roi_sidecar_path
 from auto_capcut.models import AudioMode, MotionStrength, ProjectConfig, ProjectJob, RESOLUTIONS, TargetROI
 from auto_capcut.core.camera_frame import calculate_camera_transform, project_camera_frame_center, validate_camera_frame
 from auto_capcut.core.capcut_builder import CapCutBuilder
-from auto_capcut.core.captured_effect_template import CapturedEffectTemplate, ResolvedCapturedEffectPreset
 from auto_capcut.models import EffectCue, ImageTiming, VisualEffect
 
 
@@ -40,54 +39,6 @@ def test_modern_effects_parse_and_deduplicate_targets(tmp_path: Path) -> None:
     cue = parse_effect_direction_srt(path)[0]
     assert [effect.type for effect in cue.effects] == ["HOLD", "FOCUS_ZOOM", "PAN_TO", "PULL_TO", "ALERT", "SETTLE"]
     assert [target.target_id for target in required_roi_targets([cue])] == ["part_ab", "part_c", "part_d", "penalty"]
-
-
-def test_captured_warning_uses_nested_effect_timing_and_suppresses_overlay(tmp_path: Path) -> None:
-    template = CapturedEffectTemplate(
-        {"id": "m", "effect_id": "7399465244088618245"},
-        {"id": "s", "material_id": "m", "target_timerange": {}},
-        source_effect_id="7399465244088618245",
-    )
-    resolved = ResolvedCapturedEffectPreset("warning", "7399465244088618245", template, tmp_path / "template.json")
-    builder = CapCutBuilder.__new__(CapCutBuilder)
-    builder.effect_templates = type("Repository", (), {"resolve_effect_preset": lambda self, name: resolved})()
-    effect = VisualEffect("ALERT", 5_700_000, 7_200_000, "penalty", {
-        "preset": "warning", "effect_start": "6.00s", "effect_end": "6.45s",
-    })
-    cue = EffectCue(1, 10_000_000, 18_000_000, "", (effect,))
-    warnings = []
-    timing = ImageTiming(1, 10_000_000, 18_000_000)
-    captured, keys = builder._resolve_captured_effects([cue], [timing], warnings)
-    assert captured == [(resolved, 16_000_000, 450_000)]
-    assert keys == {(0, 0)}
-    assert warnings == []
-
-    class Resolver:
-        def resolve(self, *args):
-            raise AssertionError("captured preset must bypass the legacy overlay")
-
-    builder.cc = object()
-    builder._add_alert_overlays(object(), cue, tmp_path / "001.png", timing, object(), 1.0, None, Resolver(), 0, keys)
-
-
-def test_missing_captured_preset_blocks_without_legacy_substitution() -> None:
-    builder = CapCutBuilder.__new__(CapCutBuilder)
-    builder.effect_templates = type("Repository", (), {"resolve_effect_preset": lambda self, name: None})()
-    effect = VisualEffect("ALERT", 0, 1_000_000, "penalty", {"preset": "warning"})
-    cue = EffectCue(1, 0, 1_000_000, "", (effect,))
-    warnings = []
-    with pytest.raises(ValidationError, match="Unresolved CapCut effect presets"):
-        builder._resolve_captured_effects([cue], [ImageTiming(1, 0, 1_000_000)], warnings)
-
-
-def test_multiple_unresolved_presets_are_grouped_and_deduplicated() -> None:
-    builder = CapCutBuilder.__new__(CapCutBuilder)
-    builder.effect_templates = type("Repository", (), {"resolve_effect_preset": lambda self, name: None})()
-    effects = tuple(VisualEffect("ALERT", 0, 1_000_000, "penalty", {"preset": name}) for name in ("warning_glow", "slash_reveal", "warning_glow"))
-    cues = [EffectCue(1, 0, 1_000_000, "", (effects[0],)), EffectCue(2, 1_000_000, 2_000_000, "", (effects[1],)), EffectCue(3, 2_000_000, 3_000_000, "", (effects[2],))]
-    with pytest.raises(ValidationError) as caught:
-        builder._resolve_captured_effects(cues, [ImageTiming(1, 0, 1_000_000), ImageTiming(2, 1_000_000, 2_000_000), ImageTiming(3, 2_000_000, 3_000_000)], [])
-    assert str(caught.value).splitlines() == ["Unresolved CapCut effect presets:", "- warning_glow", "- slash_reveal"]
 
 
 def test_target_reuse_is_one_roi(tmp_path: Path) -> None:

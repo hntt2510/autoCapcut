@@ -2322,7 +2322,7 @@ class DrawRenderService:
             image_scene = None
             if plan.mode is DrawMode.ADVANCED:
                 image_scene = next((value for key, value in scene_document.images.items() if key.casefold() == images[index].name.casefold()), None) if scene_document else None
-                missing = [item for item in scene_errors if item.casefold().startswith(f"image {images[index].name}".casefold())]
+                missing = [item for item in scene_errors if item.casefold().startswith(f"image {images[index].name}".casefold())] if scene_document else [f"Image {images[index].name}: scene record missing (no scene document provided)"]
                 if image_scene is not None:
                     object_ids = set(image_scene.object_map)
                     requested = [item.strip() for item in plan.draw_action.params.get("order", "").split(",") if item.strip()]
@@ -2338,7 +2338,8 @@ class DrawRenderService:
                 if image_scene is None or missing:
                     if not config.fallback_basic:
                         raise DrawRenderError("Advanced draw scene errors:\n" + "\n".join(f"- {item}" for item in (missing or [f'Image {images[index].name}: scene record missing'])) )
-                    plan = DrawImagePlan(plan.image_index, plan.image_name, plan.start_us, plan.end_us, DrawMode.BASIC, plan.style, "auto", plan.actions)
+                    plan = DrawImagePlan(plan.image_index, plan.image_name, plan.start_us, plan.end_us, DrawMode.BASIC, plan.style, "auto", plan.actions, complete_before_end_us=plan.complete_before_end_us, post_motion=plan.post_motion)
+                    image_scene = None
             output = config.output_folder / f"{index + 1:03d}_draw.mp4"
             outputs.append(renderer.render(images[index], plan, config, output, image_scene, progress))
         return outputs
@@ -2400,22 +2401,37 @@ class DrawRenderService:
             if plan.image_name and plan.image_name.casefold() != image_path.name.casefold():
                 raise DrawRenderError(f"Draw image {index + 1}: IMAGE={plan.image_name} does not match {image_path.name}")
             image_scene = None
-            if plan.mode is DrawMode.ADVANCED and scene_doc:
-                image_scene = next(
-                    (v for k, v in scene_doc.images.items() if k.casefold() == image_path.name.casefold()),
-                    None,
-                )
-                missing = [e for e in scene_errors if e.casefold().startswith(f"image {image_path.name}".casefold())]
+            if plan.mode is DrawMode.ADVANCED:
+                if scene_doc:
+                    image_scene = next(
+                        (v for k, v in scene_doc.images.items() if k.casefold() == image_path.name.casefold()),
+                        None,
+                    )
+                    missing = [e for e in scene_errors if e.casefold().startswith(f"image {image_path.name}".casefold())]
+                else:
+                    image_scene = None
+                    missing = [f"Image {image_path.name}: scene record missing (no scene document provided)"]
+
                 if image_scene is None or missing:
                     if not config.fallback_basic:
                         raise DrawRenderError(
                             "Advanced draw scene errors:\n" + "\n".join(f"- {e}" for e in (missing or [f"Image {image_path.name}: scene record missing"]))
                         )
-                    plan = DrawImagePlan(plan.image_index, plan.image_name, plan.start_us, plan.end_us, DrawMode.BASIC, plan.style, "auto", plan.actions)
+                    plan = DrawImagePlan(
+                        plan.image_index,
+                        plan.image_name,
+                        plan.start_us,
+                        plan.end_us,
+                        DrawMode.BASIC,
+                        plan.style,
+                        "auto",
+                        plan.actions,
+                        complete_before_end_us=plan.complete_before_end_us,
+                        post_motion=plan.post_motion,
+                    )
                     image_scene = None
                 else:
                     _validate_advanced_plan_targets(plan, image_scene)
-
 
             output_path = config.output_folder / f"{index + 1:03d}_draw.mp4"
 
@@ -2426,4 +2442,3 @@ class DrawRenderService:
 
             outputs[index] = renderer.render(image_path, plan, config, output_path, image_scene, _sub_progress)
         return outputs
-

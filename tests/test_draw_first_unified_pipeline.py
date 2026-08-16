@@ -200,8 +200,9 @@ POST_MOTION subtle_pan_left
         draft_folder=draft_folder,
         use_image_timing=True,
         image_timing_srt=srt_path,
+        motion_enabled=True,
+        effect_direction_srt=srt_path,
         draw_enabled=True,
-        draw_effect_srt=srt_path,
         draw_scene_json=scene_path,
         draw_fallback_basic=True,
         draw_reuse_cache=True,
@@ -214,7 +215,6 @@ POST_MOTION subtle_pan_left
         image_timing_srt=srt_path,
         config=config,
     )
-
 
     draft_folder.mkdir(parents=True, exist_ok=True)
     builder = CapCutBuilder()
@@ -229,3 +229,222 @@ POST_MOTION subtle_pan_left
     for v in videos:
         assert Path(v["path"]).is_file()
 
+
+def test_invalid_advanced_scene_fallback_off_blocks_build(tmp_path: Path) -> None:
+    img_dir = tmp_path / "images"
+    img_dir.mkdir()
+    img1 = _make_dummy_image(img_dir / "001.png", "white")
+
+    srt_path = tmp_path / "effect.srt"
+    srt_path.write_text(
+        """1
+00:00:00,000 --> 00:00:04,000
+MODE advanced_draw
+DRAW 0s-4s: order=missing_target
+""",
+        encoding="utf-8",
+    )
+
+    import wave
+    dummy_audio = tmp_path / "audio.wav"
+    with wave.open(str(dummy_audio), "w") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(44100)
+        wav_file.writeframes(b"\x00\x00" * 44100 * 4)
+
+    draft_folder = tmp_path / "draft"
+    draft_folder.mkdir(parents=True, exist_ok=True)
+    config = ProjectConfig(
+        project_name="TestBlockDraft",
+        resolution=Resolution(120, 80),
+        draft_folder=draft_folder,
+        use_image_timing=True,
+        image_timing_srt=srt_path,
+        motion_enabled=True,
+        effect_direction_srt=srt_path,
+        draw_enabled=True,
+        draw_scene_json=None,  # No scene JSON provided!
+        draw_fallback_basic=False,  # Fallback disabled!
+        draw_reuse_cache=False,
+    )
+    job = ProjectJob(
+        name="TestBlockDraft",
+        images=(img1,),
+        audio_path=dummy_audio,
+        subtitle_srt=None,
+        image_timing_srt=srt_path,
+        config=config,
+    )
+
+    builder = CapCutBuilder()
+    from auto_capcut.core.errors import DrawRenderError, ValidationError
+    with pytest.raises((ValidationError, DrawRenderError)):
+        builder.build_job(job)
+
+
+def test_invalid_advanced_scene_fallback_on_downgrades_to_basic(tmp_path: Path) -> None:
+    img_dir = tmp_path / "images"
+    img_dir.mkdir()
+    img1 = _make_dummy_image(img_dir / "001.png", "white")
+
+    srt_path = tmp_path / "effect.srt"
+    srt_path.write_text(
+        """1
+00:00:00,000 --> 00:00:04,000
+MODE advanced_draw
+DRAW 0s-4s: order=missing_target
+""",
+        encoding="utf-8",
+    )
+
+    import wave
+    dummy_audio = tmp_path / "audio.wav"
+    with wave.open(str(dummy_audio), "w") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(44100)
+        wav_file.writeframes(b"\x00\x00" * 44100 * 4)
+
+    draft_folder = tmp_path / "draft"
+    draft_folder.mkdir(parents=True, exist_ok=True)
+    config = ProjectConfig(
+        project_name="TestFallbackDraft",
+        resolution=Resolution(120, 80),
+        draft_folder=draft_folder,
+        use_image_timing=True,
+        image_timing_srt=srt_path,
+        motion_enabled=True,
+        effect_direction_srt=srt_path,
+        draw_enabled=True,
+        draw_scene_json=None,  # No scene JSON provided!
+        draw_fallback_basic=True,  # Fallback enabled!
+        draw_reuse_cache=False,
+    )
+    job = ProjectJob(
+        name="TestFallbackDraft",
+        images=(img1,),
+        audio_path=dummy_audio,
+        subtitle_srt=None,
+        image_timing_srt=srt_path,
+        config=config,
+    )
+
+    builder = CapCutBuilder()
+    result = builder.build_job(job)
+    assert result is not None
+    assert result.project_path.is_dir()
+
+
+def test_production_uses_effect_direction_srt_and_ignores_conflicting_draw_effect_srt(tmp_path: Path) -> None:
+    img_dir = tmp_path / "images"
+    img_dir.mkdir()
+    img1 = _make_dummy_image(img_dir / "001.png", "white")
+
+    # Authoritative production effect SRT (valid basic_draw cue)
+    main_effect_srt = tmp_path / "main_effect.srt"
+    main_effect_srt.write_text(
+        """1
+00:00:00,000 --> 00:00:03,000
+MODE basic_draw
+COMPLETE_BEFORE_END 1.0s
+POST_MOTION none
+""",
+        encoding="utf-8",
+    )
+
+    # Conflicting legacy draw SRT (broken syntax / impossible duration that would fail if parsed/used)
+    conflicting_draw_srt = tmp_path / "conflicting_legacy_draw.srt"
+    conflicting_draw_srt.write_text(
+        """1
+00:00:00,000 --> 00:00:99,000
+INVALID_DIRECTIVE_THAT_WOULD_FAIL
+""",
+        encoding="utf-8",
+    )
+
+    import wave
+    dummy_audio = tmp_path / "audio.wav"
+    with wave.open(str(dummy_audio), "w") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(44100)
+        wav_file.writeframes(b"\x00\x00" * 44100 * 3)
+
+    draft_folder = tmp_path / "draft"
+    draft_folder.mkdir(parents=True, exist_ok=True)
+    config = ProjectConfig(
+        project_name="TestConflictDraft",
+        resolution=Resolution(120, 80),
+        draft_folder=draft_folder,
+        use_image_timing=True,
+        image_timing_srt=main_effect_srt,
+        motion_enabled=True,
+        effect_direction_srt=main_effect_srt,       # Main authoritative source
+        draw_effect_srt=conflicting_draw_srt,        # Legacy field populated with conflicting/broken content
+        draw_enabled=True,
+        draw_reuse_cache=False,
+    )
+    job = ProjectJob(
+        name="TestConflictDraft",
+        images=(img1,),
+        audio_path=dummy_audio,
+        subtitle_srt=None,
+        image_timing_srt=main_effect_srt,
+        config=config,
+    )
+
+    builder = CapCutBuilder()
+    # Must succeed by using main_effect_srt and ignoring conflicting_draw_srt
+    result = builder.build_job(job)
+    assert result is not None
+    assert result.project_path.is_dir()
+    draft_json = result.project_path / "draft_content.json"
+    assert draft_json.is_file()
+    content = json.loads(draft_json.read_text(encoding="utf-8"))
+    videos = content.get("materials", {}).get("videos", [])
+    assert len(videos) == 1
+    assert Path(videos[0]["path"]).is_file()
+
+
+
+@pytest.mark.parametrize("preset", [
+    "none",
+    "random_light",
+    "subtle_zoom_in",
+    "subtle_zoom_out",
+    "subtle_pan_left",
+    "subtle_pan_right",
+])
+def test_all_six_post_motion_presets_evaluated_in_buffer(tmp_path: Path, preset: str) -> None:
+    img_path = _make_dummy_image(tmp_path / f"001_{preset}.png")
+    plan = DrawImagePlan(
+        1,
+        img_path.name,
+        0,
+        6_000_000,
+        DrawMode.BASIC,
+        DrawStyle.V1,
+        "auto",
+        (),
+        complete_before_end_us=2_000_000,
+        post_motion=preset,
+    )
+    renderer = DrawRenderer(tmp_path / "cache")
+    artifact = prepare_image(img_path, renderer.cache_root, plan.style, TextMode.KEEP, False)
+    schedule = _basic_schedule(artifact.strokes, plan)
+
+    # During draw (t=2s): always full view
+    cam_draw = _camera_state_at(schedule, plan, None, 2_000_000, 1.5, (120, 80))
+    assert cam_draw.viewport == (0.0, 0.0, 1.0, 1.0)
+
+    # At completion buffer end (t=6s):
+    cam_end = _camera_state_at(schedule, plan, None, 6_000_000, 1.5, (120, 80))
+    if preset == "none":
+        assert cam_end.viewport == (0.0, 0.0, 1.0, 1.0)
+    elif preset == "subtle_zoom_in":
+        assert cam_end.viewport[2] < 1.0  # Zoomed in
+    elif preset == "subtle_zoom_out":
+        assert cam_end.viewport[2] <= 1.0
+    elif preset in {"subtle_pan_left", "subtle_pan_right"}:
+        assert cam_end.viewport[0] != 0.0 or cam_end.viewport[1] != 0.0 or cam_end.viewport[2] != 1.0

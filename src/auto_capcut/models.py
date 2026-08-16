@@ -299,6 +299,12 @@ class ProjectConfig:
     draw_diagnostics: bool = False
     draw_reuse_cache: bool = True
 
+    @property
+    def main_effect_srt(self) -> Optional[Path]:
+        """G02: Canonical name for the single production effect SRT (was effect_direction_srt)."""
+        return self.effect_direction_srt
+
+
 
 
 @dataclass(frozen=True)

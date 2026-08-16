@@ -109,7 +109,6 @@ def test_render_draw_clips_calls_render_subset_for_draw_cues(tmp_path: Path) -> 
 
         builder = CapCutBuilder.__new__(CapCutBuilder)
         builder.cc = MagicMock()
-        builder.effect_templates = MagicMock()
         warnings: list[str] = []
         result = builder._render_draw_clips(job, timings, lambda *a: None, warnings)
 
@@ -132,7 +131,6 @@ def test_render_draw_clips_skips_when_no_draw_cues(tmp_path: Path) -> None:
 
         builder = CapCutBuilder.__new__(CapCutBuilder)
         builder.cc = MagicMock()
-        builder.effect_templates = MagicMock()
         warnings: list[str] = []
         result = builder._render_draw_clips(job, timings, lambda *a: None, warnings)
 
@@ -169,7 +167,6 @@ def test_draw_parse_failure_raises_validation_error(tmp_path: Path) -> None:
     )
     builder = CapCutBuilder.__new__(CapCutBuilder)
     builder.cc = MagicMock()
-    builder.effect_templates = MagicMock()
     warnings: list[str] = []
     with pytest.raises(ValidationError):
         builder._render_draw_clips(job, _timings(1), lambda *a: None, warnings)
@@ -190,7 +187,6 @@ def test_draw_render_failure_raises_validation_error(tmp_path: Path) -> None:
 
         builder = CapCutBuilder.__new__(CapCutBuilder)
         builder.cc = MagicMock()
-        builder.effect_templates = MagicMock()
         warnings: list[str] = []
         with pytest.raises(DrawRenderError, match="FFmpeg failed"):
             builder._render_draw_clips(job, timings, lambda *a: None, warnings)
@@ -216,7 +212,6 @@ def test_draw_duration_mismatch_blocks_build(tmp_path: Path) -> None:
 
         builder = CapCutBuilder.__new__(CapCutBuilder)
         builder.cc = MagicMock()
-        builder.effect_templates = MagicMock()
         warnings: list[str] = []
         with pytest.raises(ValidationError, match="duration mismatch"):
             builder._render_draw_clips(job, timings, lambda *a: None, warnings)
@@ -234,7 +229,6 @@ def test_missing_draw_clip_raises_in_add_images(tmp_path: Path) -> None:
     mock_mat.height = 1080
     cc.VideoMaterial.return_value = mock_mat
     builder.cc = cc
-    builder.effect_templates = MagicMock()
 
     images = (tmp_path / "img1.png", tmp_path / "img2.png")
     for img in images:
@@ -259,7 +253,7 @@ def test_missing_draw_clip_raises_in_add_images(tmp_path: Path) -> None:
     warnings: list[str] = []
 
     with pytest.raises(ValidationError, match="DRAW cue failed to produce a valid rendered draw clip"):
-        builder._add_images(script, job, timings, warnings, effects, frozenset(), draw_clips={})
+        builder._add_images(script, job, timings, warnings, effects, draw_clips={})
 
 
 def test_unified_flow_single_effect_srt_routes_mixed_cues(tmp_path: Path) -> None:
@@ -312,7 +306,6 @@ def test_unified_flow_single_effect_srt_routes_mixed_cues(tmp_path: Path) -> Non
 
         builder = CapCutBuilder.__new__(CapCutBuilder)
         builder.cc = MagicMock()
-        builder.effect_templates = MagicMock()
         warnings: list[str] = []
         draw_clips = builder._render_draw_clips(job, timings, lambda *a: None, warnings)
 
@@ -331,7 +324,6 @@ def test_add_images_substitutes_draw_mp4_and_applies_motion_to_standard_images(t
     mock_material.height = 1080
     cc.VideoMaterial.return_value = mock_material
     builder.cc = cc
-    builder.effect_templates = MagicMock()
 
     images = (tmp_path / "img1.png", tmp_path / "img2.png", tmp_path / "img3.png")
     for img in images:
@@ -365,7 +357,7 @@ def test_add_images_substitutes_draw_mp4_and_applies_motion_to_standard_images(t
     effects = [cue1, None, cue3]
 
     warnings: list[str] = []
-    builder._add_images(script, job, timings, warnings, effects, frozenset(), draw_clips)
+    builder._add_images(script, job, timings, warnings, effects, draw_clips)
 
     assert len(added_segments) == 3
     # Check that cc.VideoMaterial was called with fake_mp4 for index 1
