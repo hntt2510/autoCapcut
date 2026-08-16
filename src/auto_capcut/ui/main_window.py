@@ -79,7 +79,7 @@ class MainWindow(QMainWindow):
         subtitle_form.addRow(self.import_subtitles); subtitle_form.addRow("Subtitle SRT", subtitle_row); layout.addWidget(subtitles)
 
         motion = QGroupBox("MAIN EFFECT SRT & MOTION"); motion_form = QFormLayout(motion)
-        self.motion_enabled = QCheckBox("Enable Visual Effects"); self.motion_enabled.setChecked(True)
+        self.motion_enabled = QCheckBox("Enable post-draw motion"); self.motion_enabled.setChecked(True)
         self.motion_mode = QComboBox(); self.motion_mode.addItems(["None", "Random Light", "Subtle Zoom In", "Subtle Zoom Out", "Subtle Pan Left", "Subtle Pan Right"])
         self.effect_path = QLineEdit(); effect_browse = QPushButton("Browse"); effect_browse.clicked.connect(lambda: self._browse_file(self.effect_path, "SRT files (*.srt)")); effect_row = QHBoxLayout(); effect_row.addWidget(self.effect_path); effect_row.addWidget(effect_browse)
         self.effect_status = QLabel("Effect status: not selected"); self.effect_status.setWordWrap(True)
@@ -104,16 +104,9 @@ class MainWindow(QMainWindow):
         draw_grp = QGroupBox("DRAW ANIMATION")
         draw_form = QFormLayout(draw_grp)
 
-        self.draw_enabled = QCheckBox("Enable draw rendering")
-        self.draw_enabled.setChecked(True)
-        draw_form.addRow(self.draw_enabled)
-
         self.draw_source_label = QLabel("Uses Main Effect SRT (timing + draw mode source)")
         self.draw_source_label.setStyleSheet("color: #666; font-style: italic;")
         draw_form.addRow("Effect source:", self.draw_source_label)
-
-        # Internal / backwards-compat holder (empty by default)
-        self.draw_effect_path = QLineEdit()
 
         self.draw_scene_path = QLineEdit()
         draw_scene_browse = QPushButton("Browse")
@@ -145,9 +138,9 @@ class MainWindow(QMainWindow):
         transitions_index = layout.indexOf(transitions)
         layout.insertWidget(transitions_index + 1, draw_grp)
 
-        self.draw_enabled.toggled.connect(lambda *_: (self._update_enabled(), self._update_draw_scene_status()))
         self.draw_scene_path.textChanged.connect(lambda *_: self._update_draw_scene_status())
         self.draw_fallback_basic.toggled.connect(lambda *_: self._update_draw_scene_status())
+
 
 
     def _add_image_folder(self) -> None:
@@ -176,9 +169,6 @@ class MainWindow(QMainWindow):
 
     def _update_draw_scene_status(self) -> None:
         if not hasattr(self, "draw_scene_status"):
-            return
-        if not self.draw_enabled.isChecked():
-            self.draw_scene_status.setText("Draw scene: draw rendering disabled")
             return
 
         images = self._current_images()
@@ -273,6 +263,7 @@ class MainWindow(QMainWindow):
         dialog.exec()
         self._update_draw_scene_status()
 
+
     def _update_effect_status(self) -> None:
         path = Path(self.effect_path.text()) if self.effect_path.text() else None
         if path is None or not path.is_file():
@@ -296,9 +287,8 @@ class MainWindow(QMainWindow):
         self.transition_type.setEnabled(self.transition_enabled.isChecked())
         self.transition_duration.setEnabled(self.transition_enabled.isChecked())
         self.audio_path.setPlaceholderText("Folder containing audio files" if self.folder_audio.isChecked() else "Audio file")
-        draw_on = self.draw_enabled.isChecked()
         for w in (self.draw_source_label, self.draw_scene_path, self.edit_draw_objects_btn, self.draw_scene_status, self.draw_remove_bg, self.draw_fallback_basic, self.draw_diagnostics, self.draw_reuse_cache):
-            w.setEnabled(draw_on)
+            w.setEnabled(True)
 
     def _config(self) -> ProjectConfig:
         return ProjectConfig(
@@ -322,8 +312,8 @@ class MainWindow(QMainWindow):
             music_folder=Path(self.music_path.text()) if self.music_path.text() else None,
             music_volume=self.music_volume.value() / 100,
             draft_folder=Path(self.draft_path.text()) if self.draft_path.text() else None,
-            # ── Draw Animation ──────────────────────────────────────────
-            draw_enabled=self.draw_enabled.isChecked(),
+            # ── Draw Animation (Always active in normal production) ─────
+            draw_enabled=True,
             draw_scene_json=Path(self.draw_scene_path.text()) if self.draw_scene_path.text() else None,
             draw_remove_background=self.draw_remove_bg.isChecked(),
             draw_fallback_basic=self.draw_fallback_basic.isChecked(),
@@ -359,7 +349,6 @@ class MainWindow(QMainWindow):
             "effect_path": self.effect_path.text(), "motion_mode": self.motion_mode.currentText(),
             "motion_strength": self.motion_strength.currentText(),
             # Draw Animation settings
-            "draw_enabled": self.draw_enabled.isChecked(),
             "draw_scene_path": self.draw_scene_path.text(),
             "draw_remove_bg": self.draw_remove_bg.isChecked(),
             "draw_fallback_basic": self.draw_fallback_basic.isChecked(),
@@ -374,12 +363,12 @@ class MainWindow(QMainWindow):
         self.settings.remove("visual_manifest_path")
         self.settings.remove("timing_path")
         self.settings.remove("draw_effect_path")
+        self.settings.remove("draw_enabled")
         self.project_name.setText(self.settings.value("project_name", "")); resolution = self.settings.value("resolution", "1920x1080"); index = self.resolution.findText(str(resolution)); self.resolution.setCurrentIndex(index if index >= 0 else 0)
         for key, widget in (("audio_path", self.audio_path), ("subtitle_path", self.subtitle_path), ("logo_path", self.logo_path), ("music_path", self.music_path), ("draft_path", self.draft_path)): widget.setText(str(self.settings.value(key, widget.text())))
         self.effect_path.setText(str(self.settings.value("effect_path", ""))); saved_mode = str(self.settings.value("motion_mode", "Random Light")); legacy = {"Random": "Random Light", "Zoom In": "Subtle Zoom In", "Zoom Out": "Subtle Zoom Out", "Pan Left": "Subtle Pan Left", "Pan Right": "Subtle Pan Right"}; saved_mode = legacy.get(saved_mode, saved_mode); self.motion_mode.setCurrentText(saved_mode if self.motion_mode.findText(saved_mode) >= 0 else "Random Light"); self.motion_strength.setCurrentText(str(self.settings.value("motion_strength", MotionStrength.SUBTLE.value))); self.motion_enabled.setChecked(self.settings.value("motion_enabled", True, type=bool)); self.transition_enabled.setChecked(self.settings.value("transition_enabled", True, type=bool)); image_folder = str(self.settings.value("image_folder", ""));
         if image_folder: self.image_list.addItem(image_folder); self._image_list_changed()
         # Draw Animation settings
-        self.draw_enabled.setChecked(self.settings.value("draw_enabled", True, type=bool))
         self.draw_scene_path.setText(str(self.settings.value("draw_scene_path", "")))
         self.draw_remove_bg.setChecked(self.settings.value("draw_remove_bg", False, type=bool))
         self.draw_fallback_basic.setChecked(self.settings.value("draw_fallback_basic", True, type=bool))

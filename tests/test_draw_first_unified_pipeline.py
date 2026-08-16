@@ -556,3 +556,99 @@ def test_resolve_timings_validations(tmp_path: Path) -> None:
     with pytest.raises(ValidationError, match="Main Effect SRT / audio duration mismatch"):
         resolve_timings(job_dur)
 
+
+def test_missing_main_effect_srt_blocks_production(tmp_path: Path) -> None:
+    """Requirement A & 3: 3 images + audio + Main Effect SRT=None MUST raise ValidationError."""
+    from auto_capcut.core.errors import ValidationError
+    from auto_capcut.core.media import validate_config_paths
+    from auto_capcut.core.planning import resolve_timings
+    import wave
+
+    img1 = _make_dummy_image(tmp_path / "001.png")
+    img2 = _make_dummy_image(tmp_path / "002.png")
+    img3 = _make_dummy_image(tmp_path / "003.png")
+
+    audio_path = tmp_path / "audio.wav"
+    with wave.open(str(audio_path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(16000)
+        wf.writeframes(b"\x00\x00" * 16000 * 15)
+
+    config = ProjectConfig(
+        project_name="no_srt_test",
+        image_folders=[tmp_path],
+        audio_path=audio_path,
+        draft_folder=tmp_path,
+        effect_direction_srt=None,
+    )
+
+    with pytest.raises(ValidationError, match="Choose a Main Effect SRT."):
+        validate_config_paths(config)
+
+    job = ProjectJob("no_srt_job", (img1, img2, img3), audio_path, None, None, config)
+    with pytest.raises(ValidationError, match="Choose a Main Effect SRT."):
+        resolve_timings(job)
+
+
+def test_legacy_standard_cue_blocks_production_in_planning(tmp_path: Path) -> None:
+    """Requirement B: Explicit legacy standard FX cues MUST block production planning."""
+    from auto_capcut.core.errors import ValidationError
+    from auto_capcut.core.planning import resolve_timings
+    import wave
+
+    img1 = _make_dummy_image(tmp_path / "001.png")
+    img2 = _make_dummy_image(tmp_path / "002.png")
+
+    audio_path = tmp_path / "audio.wav"
+    with wave.open(str(audio_path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(16000)
+        wf.writeframes(b"\x00\x00" * 16000 * 4)
+
+    legacy_srt = tmp_path / "legacy.srt"
+    legacy_srt.write_text(
+        "1\n00:00:00,000 --> 00:00:02,000\nMODE basic_draw\n\n"
+        "2\n00:00:02,000 --> 00:00:04,000\nImage 2 FX\nHOLD 0s - 2s :\n",
+        encoding="utf-8",
+    )
+    config = ProjectConfig(
+        project_name="legacy_cue_test",
+        image_folders=[tmp_path],
+        audio_path=audio_path,
+        effect_direction_srt=legacy_srt,
+    )
+    job = ProjectJob("legacy_cue_job", (img1, img2), audio_path, None, None, config)
+    with pytest.raises(ValidationError, match="Image 002 uses a legacy standard FX cue"):
+        resolve_timings(job)
+
+
+def test_minimal_cue_no_mode_defaults_to_basic_draw(tmp_path: Path) -> None:
+    """Requirement C: Minimal cue without explicit MODE line defaults to basic_draw."""
+    from auto_capcut.core.unified_effect_parser import parse_unified_effect
+    srt_path = tmp_path / "minimal.srt"
+    srt_path.write_text(
+        "1\n00:00:00,000 --> 00:00:03,000\nDRAW 0s-3s:\n\n",
+        encoding="utf-8",
+    )
+    unified = parse_unified_effect(srt_path)
+    assert len(unified.cues) == 1
+    cue = unified.cues[0]
+    assert cue.kind == "draw"
+    assert cue.draw_plan is not None
+    assert cue.draw_plan.mode == DrawMode.BASIC
+
+
+def test_production_ui_config_always_has_draw_enabled_true() -> None:
+    """Requirement D: ProjectConfig created by production UI always sets draw_enabled=True."""
+    from PyQt6.QtWidgets import QApplication
+    from auto_capcut.ui.main_window import MainWindow
+    import sys
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    win = MainWindow()
+    cfg = win._config()
+    assert cfg.draw_enabled is True
+
+

@@ -50,8 +50,11 @@ def _create_unified_srt(path: Path) -> Path:
         "\n".join([
             "1",
             "00:00:00,000 --> 00:00:02,000",
-            "Image 1 FX",
-            "HOLD 0s - 2s :",
+            "MODE=basic_draw",
+            "STYLE=v1",
+            "COMPLETE_BEFORE_END 0.5s",
+            "POST_MOTION subtle_zoom_in",
+            "DRAW 0s-1.5s:",
             "",
             "2",
             "00:00:02,000 --> 00:00:04,000",
@@ -61,8 +64,11 @@ def _create_unified_srt(path: Path) -> Path:
             "",
             "3",
             "00:00:04,000 --> 00:00:06,000",
-            "Image 3 FX",
-            "HOLD 0s - 2s :",
+            "MODE=basic_draw",
+            "STYLE=v1",
+            "COMPLETE_BEFORE_END 0.5s",
+            "POST_MOTION subtle_pan_left",
+            "DRAW 0s-1.5s:",
             "",
         ]),
         encoding="utf-8",
@@ -70,7 +76,7 @@ def _create_unified_srt(path: Path) -> Path:
     return path
 
 
-def test_real_mixed_draw_capcut_smoke(tmp_path: Path) -> None:
+def test_real_draw_capcut_smoke(tmp_path: Path) -> None:
     """Full end-to-end smoke test verifying real DrawRenderer + FFmpeg + CapCut draft creation."""
     # 1. Create assets
     img_dir = tmp_path / "images"
@@ -136,49 +142,53 @@ def test_real_mixed_draw_capcut_smoke(tmp_path: Path) -> None:
     segments = images_track.get("segments", [])
     assert len(segments) == 3, f"Expected 3 visual segments, got {len(segments)}"
 
-    # Segment 1: Image 001
-    seg1 = segments[0]
-    mat1_path = video_map.get(seg1.get("material_id"), "")
-    assert Path(mat1_path).name == "001.png"
-    assert seg1["target_timerange"]["start"] == 0
-    assert seg1["target_timerange"]["duration"] == 2_000_000
+    for idx, seg in enumerate(segments, 1):
+        mat_path = video_map.get(seg.get("material_id"), "")
+        assert mat_path.endswith(f"{idx:03d}_draw.mp4")
+        assert Path(mat_path).is_file()
+        assert seg["target_timerange"]["start"] == (idx - 1) * 2_000_000
+        assert seg["target_timerange"]["duration"] == 2_000_000
+        assert len(seg.get("keyframe_list", [])) == 0, f"Draw clip should not have keyframes"
 
-    # Segment 2: Generated Draw MP4
-    seg2 = segments[1]
-    mat2_path = video_map.get(seg2.get("material_id"), "")
-    assert "002_draw.mp4" in mat2_path or mat2_path.endswith(".mp4")
-    assert Path(mat2_path).is_file()
-    assert seg2["target_timerange"]["start"] == 2_000_000
-    assert seg2["target_timerange"]["duration"] == 2_000_000
-
-    # Draw segment must receive NO duplicate CapCut camera keyframes
-    # (keyframe references in segment should be empty or default)
-    keyframe_list = seg2.get("keyframe_list", [])
-    assert len(keyframe_list) == 0, f"Draw clip should not have keyframes, got {keyframe_list}"
-
-    # Segment 3: Image 003
-    seg3 = segments[2]
-    mat3_path = video_map.get(seg3.get("material_id"), "")
-    assert Path(mat3_path).name == "003.png"
-    assert seg3["target_timerange"]["start"] == 4_000_000
-    assert seg3["target_timerange"]["duration"] == 2_000_000
-
-    # 7. Verify real rendered draw MP4 on disk
-    draw_mp4 = Path(mat2_path)
-    assert draw_mp4.is_file()
-    assert draw_mp4.stat().st_size > 1000  # Non-trivial MP4 file
-
-    # Probed duration must match 2.0s within tolerance (~70ms)
-    probed_us = probe_duration_us(draw_mp4)
-    assert abs(probed_us - 2_000_000) <= 70_000, f"Probed draw MP4 duration {probed_us}us differs from 2,000,000us"
-
-    # 8. Verify audio track
+    # 7. Verify audio track
     audio_track = next((t for t in tracks if t.get("name") == "Main Audio" or (t.get("type") == "audio" and len(t.get("segments", [])) > 0)), None)
     assert audio_track is not None, f"Main Audio track not found in tracks: {[(t.get('name'), t.get('type')) for t in tracks]}"
     audio_segs = audio_track.get("segments", [])
     assert len(audio_segs) >= 1
     assert audio_segs[0]["target_timerange"]["start"] == 0
     assert audio_segs[0]["target_timerange"]["duration"] == 6_000_000
+
+
+def test_legacy_standard_cue_blocks_production(tmp_path: Path) -> None:
+    """Requirement: Explicit legacy standard FX cues in Main Effect SRT MUST block production."""
+    from auto_capcut.core.errors import ValidationError
+    from auto_capcut.core.media import validate_config_paths
+
+    img_dir = tmp_path / "images"
+    img_dir.mkdir(parents=True, exist_ok=True)
+    img1 = _create_dummy_image(img_dir / "001.png", "white", "Slide 1")
+
+    audio_file = _create_dummy_wav(tmp_path / "audio.wav", duration_seconds=2.0)
+    legacy_srt = tmp_path / "legacy.srt"
+    legacy_srt.write_text(
+        "1\n00:00:00,000 --> 00:00:02,000\nImage 1 FX\nHOLD 0s - 2s :\n",
+        encoding="utf-8",
+    )
+    drafts_dir = tmp_path / "drafts"
+    drafts_dir.mkdir(parents=True, exist_ok=True)
+
+    config = ProjectConfig(
+        project_name="legacy_fail",
+        resolution=RESOLUTIONS["1920x1080"],
+        image_folders=[img_dir],
+        audio_path=audio_file,
+        draft_folder=drafts_dir,
+        effect_direction_srt=legacy_srt,
+    )
+
+    with pytest.raises(ValidationError, match="uses a legacy standard FX cue"):
+        validate_config_paths(config)
+
 
 
 def test_production_three_image_advanced_draw_workflow(tmp_path: Path) -> None:

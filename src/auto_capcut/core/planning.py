@@ -60,6 +60,15 @@ def resolve_timings(job: ProjectJob) -> tuple[list[ImageTiming], int]:
         if unified.cues[0].start_us != 0:
             raise ValidationError(f"Main Effect SRT error: First cue must start at 00:00:00,000, got {unified.cues[0].start_us / 1_000_000:.3f}s")
 
+        # Verify all cues are draw cues
+        for cue in unified.cues:
+            if cue.kind != "draw" or cue.draw_plan is None:
+                raise ValidationError(
+                    f"Image {cue.index:03d} uses a legacy standard FX cue. "
+                    "Production Main Effect SRT is draw-first. "
+                    "Remove the legacy FX directive or use basic_draw/advanced_draw."
+                )
+
         # Verify contiguous cues (no gaps or overlaps)
         for c1, c2 in zip(unified.cues, unified.cues[1:]):
             if c1.end_us != c2.start_us:
@@ -77,7 +86,7 @@ def resolve_timings(job: ProjectJob) -> tuple[list[ImageTiming], int]:
         timings = [ImageTiming(i, cue.start_us, cue.end_us) for i, cue in enumerate(unified.cues)]
         return timings, final_end_us
 
-    # 2. Legacy fallback: image_timing_srt if passed
+    # 2. Legacy fallback: image_timing_srt if explicitly passed
     if job.image_timing_srt and Path(job.image_timing_srt).is_file():
         timings = parse_image_timing_srt(job.image_timing_srt)
         ranges = calculate_ranges(len(job.images), timings[-1].end_us, timings)
@@ -85,8 +94,9 @@ def resolve_timings(job: ProjectJob) -> tuple[list[ImageTiming], int]:
             raise ValidationError(f"Image timing/audio mismatch: timing ends at {ranges[-1].end_us / 1_000_000:.3f}s, audio is {audio_duration / 1_000_000:.3f}s")
         return ranges, ranges[-1].end_us
 
-    # 3. Audio-only fallback without effect file: equal division
-    return calculate_ranges(len(job.images), audio_duration), audio_duration
+    # Production requires Main Effect SRT
+    raise ValidationError("Choose a Main Effect SRT.")
+
 
 
 

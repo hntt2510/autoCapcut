@@ -92,13 +92,27 @@ def validate_config_paths(config: ProjectConfig) -> None:
             raise ValidationError("No supported audio files found")
     if config.import_subtitles and audio_mode == "single" and config.subtitle_srt and not config.subtitle_srt.is_file():
         raise ValidationError("Subtitle SRT does not exist")
-    if getattr(config, "use_image_timing", False) and (getattr(config, "image_timing_srt", None) is None or not Path(config.image_timing_srt).is_file()):
-        raise ValidationError("Image Timing SRT does not exist")
-    if config.effect_direction_srt is not None and not Path(config.effect_direction_srt).is_file():
-        raise ValidationError("Main Effect SRT does not exist")
+
+    # In production, Main Effect SRT is REQUIRED
+    main_srt = getattr(config, "main_effect_srt", None) or getattr(config, "effect_direction_srt", None)
+    if main_srt is None or not Path(main_srt).is_file():
+        raise ValidationError("Choose a Main Effect SRT.")
+
+    # Validate that every cue in the production Main Effect SRT is draw-first
+    from auto_capcut.core.unified_effect_parser import parse_unified_effect
+    unified = parse_unified_effect(main_srt)
+    for cue in unified.cues:
+        if cue.kind != "draw" or cue.draw_plan is None:
+            raise ValidationError(
+                f"Image {cue.index:03d} uses a legacy standard FX cue. "
+                "Production Main Effect SRT is draw-first. "
+                "Remove the legacy FX directive or use basic_draw/advanced_draw."
+            )
+
     if config.logo_enabled and (config.logo_path is None or not config.logo_path.is_file()):
         raise ValidationError("Logo file is invalid")
     if config.music_enabled and (config.music_folder is None or not config.music_folder.is_dir()):
         raise ValidationError("Music folder does not exist")
     if config.draft_folder is None or not config.draft_folder.is_dir():
         raise ValidationError("CapCut draft folder not found")
+
