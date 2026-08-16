@@ -325,39 +325,161 @@ class DrawCanvas(QWidget):
 
 
 class DrawObjectEditorDialog(QDialog):
-    def __init__(self, images: list[Path], scene_path: Path, canvas_size: tuple[int, int], parent=None) -> None:
+    def __init__(
+        self,
+        images: list[Path],
+        scene_path: Path,
+        canvas_size: tuple[int, int],
+        parent=None,
+        *,
+        initial_image_index: int = 0,
+        allowed_image_names: list[str] | None = None,
+        required_ids_by_image: dict[str, list[str]] | None = None,
+        camera_frame_ids_by_image: dict[str, set[str]] | None = None,
+    ) -> None:
+        """Edit draw objects for a set of images.
+
+        Parameters
+        ----------
+        images:
+            All project images (may be filtered by allowed_image_names).
+        scene_path:
+            Where to load / save the SceneDocument JSON.
+        canvas_size:
+            (width, height) of the output resolution for aspect-ratio.
+        initial_image_index:
+            Index into *images* (after filtering) to start at. 0 = first.
+        allowed_image_names:
+            When provided, the image dropdown is restricted to these filenames
+            (case-insensitive). Useful for the "Configure Advanced Images" queue.
+            Existing call sites that pass no value keep the full image list.
+        required_ids_by_image:
+            Dict mapping image filename (casefold) → list of required object IDs.
+            When provided, a "Required by SRT" section is shown in the controls
+            panel and an "Add Required Object ▼" dropdown is offered.
+        camera_frame_ids_by_image:
+            Dict mapping image filename (casefold) → set of IDs needing camera_frame.
+        """
         super().__init__(parent)
         self.setWindowTitle("Edit Draw Objects")
-        self.resize(900, 650)
-        self.images = images
+        self.resize(960, 680)
+
+        # Filter images to allowed subset (preserve original order)
+        if allowed_image_names is not None:
+            allowed_cf = {n.casefold() for n in allowed_image_names}
+            self.images = [img for img in images if img.name.casefold() in allowed_cf]
+            if not self.images:
+                self.images = images  # fallback: show all if filter is empty
+        else:
+            self.images = images
+
         self.scene_path = scene_path
         self.canvas_size = canvas_size
+        self._required_ids_by_image: dict[str, list[str]] = (
+            {k.casefold(): v for k, v in required_ids_by_image.items()}
+            if required_ids_by_image else {}
+        )
+        self._camera_frame_ids_by_image: dict[str, set[str]] = (
+            {k.casefold(): v for k, v in camera_frame_ids_by_image.items()}
+            if camera_frame_ids_by_image else {}
+        )
         self.records: dict[str, dict] = {}
         self.current_image = 0
         self.current_object = -1
         self.camera_mode = False
         self._load_records()
+
         root = QVBoxLayout(self)
+
+        # Image selector row
         image_row = QHBoxLayout()
-        self.image_combo = QComboBox(); self.image_combo.addItems([path.name for path in images]); self.image_combo.currentIndexChanged.connect(self._image_changed)
-        image_row.addWidget(QLabel("Image")); image_row.addWidget(self.image_combo, 1)
+        self.image_combo = QComboBox()
+        self.image_combo.addItems([path.name for path in self.images])
+        self.image_combo.currentIndexChanged.connect(self._image_changed)
+        image_row.addWidget(QLabel("Image"))
+        image_row.addWidget(self.image_combo, 1)
         root.addLayout(image_row)
+
         body = QHBoxLayout()
-        self.object_list = QListWidget(); self.object_list.currentRowChanged.connect(self._object_changed); body.addWidget(self.object_list, 0)
-        self.canvas = DrawCanvas(images[0] if images else Path(), canvas_size[0] / canvas_size[1]); self.canvas.selection_changed.connect(self._canvas_selected); self.canvas.geometry_changed.connect(self._canvas_geometry_changed); body.addWidget(self.canvas, 1)
+        self.object_list = QListWidget()
+        self.object_list.currentRowChanged.connect(self._object_changed)
+        body.addWidget(self.object_list, 0)
+
+        self.canvas = DrawCanvas(
+            self.images[0] if self.images else Path(), canvas_size[0] / canvas_size[1]
+        )
+        self.canvas.selection_changed.connect(self._canvas_selected)
+        self.canvas.geometry_changed.connect(self._canvas_geometry_changed)
+        body.addWidget(self.canvas, 1)
+
+        # Controls panel
         controls = QVBoxLayout()
-        self.name = QLineEdit(); self.name.editingFinished.connect(self._rename)
-        self.kind = QComboBox(); self.kind.addItems(["art", "text", "warning"]); self.kind.currentTextChanged.connect(self._kind_changed)
-        controls.addWidget(QLabel("Name")); controls.addWidget(self.name); controls.addWidget(QLabel("Type")); controls.addWidget(self.kind)
-        add = QPushButton("Add Object"); add.clicked.connect(self._add); delete = QPushButton("Delete Object"); delete.clicked.connect(self._delete)
-        up = QPushButton("Move Up"); up.clicked.connect(lambda: self._move(-1)); down = QPushButton("Move Down"); down.clicked.connect(lambda: self._move(1))
-        self.camera = QCheckBox("Edit camera frame"); self.camera.toggled.connect(self._camera_toggled)
-        for button in (add, delete, up, down): controls.addWidget(button)
-        controls.addWidget(self.camera); controls.addStretch(1); body.addLayout(controls, 0)
+        self.name = QLineEdit()
+        self.name.editingFinished.connect(self._rename)
+        self.kind = QComboBox()
+        self.kind.addItems(["art", "text", "warning"])
+        self.kind.currentTextChanged.connect(self._kind_changed)
+        controls.addWidget(QLabel("Name"))
+        controls.addWidget(self.name)
+        controls.addWidget(QLabel("Type"))
+        controls.addWidget(self.kind)
+
+        add = QPushButton("Add Object")
+        add.clicked.connect(self._add)
+        delete = QPushButton("Delete Object")
+        delete.clicked.connect(self._delete)
+        up = QPushButton("Move Up")
+        up.clicked.connect(lambda: self._move(-1))
+        down = QPushButton("Move Down")
+        down.clicked.connect(lambda: self._move(1))
+        self.camera = QCheckBox("Edit camera frame")
+        self.camera.toggled.connect(self._camera_toggled)
+        for button in (add, delete, up, down):
+            controls.addWidget(button)
+        controls.addWidget(self.camera)
+
+        # "Add Required Object" dropdown — only shown when required IDs are provided
+        self._add_required_btn: QPushButton | None = None
+        self._add_required_combo: QComboBox | None = None
+        if self._required_ids_by_image:
+            controls.addWidget(QLabel(""))  # spacer label
+            req_label = QLabel("Add Required Object:")
+            req_label.setStyleSheet("font-weight: bold; margin-top: 4px;")
+            controls.addWidget(req_label)
+            self._add_required_combo = QComboBox()
+            controls.addWidget(self._add_required_combo)
+            self._add_required_btn = QPushButton("Add ▼")
+            self._add_required_btn.clicked.connect(self._add_required_object)
+            controls.addWidget(self._add_required_btn)
+
+        # Required IDs panel (read-only, shown when required_ids_by_image provided)
+        self._req_panel: QLabel | None = None
+        if self._required_ids_by_image:
+            self._req_panel = QLabel()
+            self._req_panel.setWordWrap(True)
+            self._req_panel.setStyleSheet(
+                "background: #f5f5f5; border: 1px solid #ccc; padding: 4px; "
+                "font-size: 11px; color: #333;"
+            )
+            controls.addWidget(QLabel("Required by SRT:"))
+            controls.addWidget(self._req_panel)
+
+        controls.addStretch(1)
+        body.addLayout(controls, 0)
         root.addLayout(body, 1)
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(self._save); buttons.rejected.connect(self.reject); root.addWidget(buttons)
-        self._image_changed(0)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._save)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+        # Start at requested image
+        start = max(0, min(initial_image_index, len(self.images) - 1))
+        self._image_changed(start)
+        if start != 0:
+            self.image_combo.setCurrentIndex(start)
 
     def _load_records(self) -> None:
         if self.scene_path.is_file():
@@ -396,6 +518,48 @@ class DrawObjectEditorDialog(QDialog):
         self.current_object = -1
         self._object_changed(-1)
         self._sync_canvas()
+        self._refresh_required_panel()
+
+    def _refresh_required_panel(self) -> None:
+        """Update the 'Required by SRT' panel and 'Add Required Object' combo."""
+        if not self._required_ids_by_image and self._req_panel is None:
+            return
+        if not self.images:
+            return
+        img_key = self.images[self.current_image].name.casefold()
+        req_ids = self._required_ids_by_image.get(img_key, [])
+        cam_ids = self._camera_frame_ids_by_image.get(img_key, set())
+        record = self._record()
+        present_ids = {item["id"] for item in record.get("objects", [])}
+
+        # Update required panel text
+        if self._req_panel is not None:
+            if not req_ids:
+                self._req_panel.setText("(no explicit required objects)")
+            else:
+                lines = []
+                for oid in req_ids:
+                    present = oid in present_ids
+                    icon = "✓" if present else "✗"
+                    cam_note = ""
+                    if oid in cam_ids:
+                        # check camera_frame
+                        obj = next((o for o in record.get("objects", []) if o["id"] == oid), None)
+                        if obj is not None and obj.get("camera") is None:
+                            cam_note = "  ⚠ camera frame missing"
+                        elif obj is not None:
+                            cam_note = "  (camera ✓)"
+                    lines.append(f"{icon} {oid}{cam_note}")
+                self._req_panel.setText("\n".join(lines))
+
+        # Update "Add Required Object" combo — show only missing IDs
+        if self._add_required_combo is not None:
+            self._add_required_combo.clear()
+            missing = [oid for oid in req_ids if oid not in present_ids]
+            self._add_required_combo.addItems(missing)
+            if self._add_required_btn is not None:
+                self._add_required_btn.setEnabled(bool(missing))
+
 
     def _object_changed(self, index: int) -> None:
         self.current_object = index
@@ -427,6 +591,8 @@ class DrawObjectEditorDialog(QDialog):
             record["objects"][index][key] = rect
             if key == "camera":
                 self._refresh_object_labels()
+                self._refresh_required_panel()
+
 
     def _rename(self) -> None:
         if not (0 <= self.current_object < len(self._record()["objects"])):
@@ -438,6 +604,8 @@ class DrawObjectEditorDialog(QDialog):
         self._record()["objects"][self.current_object]["id"] = value
         self._record()["order"] = [value if item == old else item for item in self._record()["order"]]
         self.object_list.item(self.current_object).setText(self._object_label(self._record()["objects"][self.current_object]))
+        self._refresh_required_panel()
+
 
     def _kind_changed(self, value: str) -> None:
         if 0 <= self.current_object < len(self._record()["objects"]):
@@ -450,7 +618,35 @@ class DrawObjectEditorDialog(QDialog):
         while any(item["id"] == f"{base}_{number}" for item in record["objects"]):
             number += 1
         item = {"id": f"{base}_{number}", "type": "art", "box": NormalizedRect(0.35, 0.35, 0.3, 0.3), "camera": None, "behavior_fields_present": frozenset()}
-        record["objects"].append(item); record["order"].append(item["id"]); self.object_list.addItem(self._object_label(item)); self.object_list.setCurrentRow(len(record["objects"]) - 1)
+        record["objects"].append(item)
+        record["order"].append(item["id"])
+        self.object_list.addItem(self._object_label(item))
+        self.object_list.setCurrentRow(len(record["objects"]) - 1)
+        self._refresh_required_panel()
+
+    def _add_required_object(self) -> None:
+        """Create an object with the selected required ID and start editing."""
+        if self._add_required_combo is None:
+            return
+        oid = self._add_required_combo.currentText().strip()
+        if not oid:
+            return
+        record = self._record()
+        # Guard against duplicate
+        if any(item["id"] == oid for item in record["objects"]):
+            # Select it instead of creating another
+            for idx, item in enumerate(record["objects"]):
+                if item["id"] == oid:
+                    self.object_list.setCurrentRow(idx)
+                    break
+            return
+        item = {"id": oid, "type": "art", "box": NormalizedRect(0.35, 0.35, 0.3, 0.3), "camera": None, "behavior_fields_present": frozenset()}
+        record["objects"].append(item)
+        record["order"].append(oid)
+        self.object_list.addItem(self._object_label(item))
+        self.object_list.setCurrentRow(len(record["objects"]) - 1)
+        self._refresh_required_panel()
+
 
     def _delete(self) -> None:
         if 0 <= self.current_object < len(self._record()["objects"]):
@@ -486,12 +682,82 @@ class DrawObjectEditorDialog(QDialog):
             self._ensure_camera_frame(self._record()["objects"][self.current_object])
         self._sync_canvas()
 
+    def _is_image_ready(self, index: int) -> bool:
+        """Check if image at index in self.images has all required objects/frames."""
+        if not (0 <= index < len(self.images)):
+            return False
+        img_name = self.images[index].name
+        img_key = img_name.casefold()
+        record = self.records.get(img_key)
+        if record is None:
+            return False
+
+        objects = record.get("objects", [])
+        obj_map = {obj["id"]: obj for obj in objects}
+
+        if self._required_ids_by_image:
+            req_ids = self._required_ids_by_image.get(img_key, [])
+            cam_ids = self._camera_frame_ids_by_image.get(img_key, set())
+
+            if req_ids:
+                if any(oid not in obj_map for oid in req_ids):
+                    return False
+            else:
+                if not objects:
+                    return False
+
+            for cid in cam_ids:
+                if cid in obj_map:
+                    if obj_map[cid].get("camera") is None:
+                        return False
+                else:
+                    return False
+
+            return True
+        else:
+            return bool(objects)
+
     def _save(self) -> None:
         images: dict[str, SceneImage] = {}
         for record in self.records.values():
-            objects = tuple(SceneObject(item["id"], item["type"], item["box"], item["camera"], item.get("render_effect", "draw"), item.get("direction", "auto"), item.get("duration_us"), item.get("pause_after_us"), frozenset(item.get("behavior_fields_present", ()))) for item in record["objects"])
-            images[record["filename"]] = SceneImage(record["filename"], record["size"], objects, tuple(record["order"]), record["hash"])
+            objects = tuple(
+                SceneObject(
+                    item["id"],
+                    item["type"],
+                    item["box"],
+                    item["camera"],
+                    item.get("render_effect", "draw"),
+                    item.get("direction", "auto"),
+                    item.get("duration_us"),
+                    item.get("pause_after_us"),
+                    frozenset(item.get("behavior_fields_present", ())),
+                )
+                for item in record["objects"]
+            )
+            images[record["filename"]] = SceneImage(
+                record["filename"],
+                record["size"],
+                objects,
+                tuple(record["order"]),
+                record["hash"],
+            )
         save_scene(SceneDocument(1, images, self.scene_path), self.scene_path)
+
+        # In queue mode with required IDs: if current image is ready and another image is incomplete, auto-advance
+        if self._required_ids_by_image and len(self.images) > 1:
+            if self._is_image_ready(self.current_image):
+                next_incomplete = None
+                n = len(self.images)
+                for offset in range(1, n):
+                    idx = (self.current_image + offset) % n
+                    if not self._is_image_ready(idx):
+                        next_incomplete = idx
+                        break
+
+                if next_incomplete is not None:
+                    self.image_combo.setCurrentIndex(next_incomplete)
+                    return
+
         self.accept()
 
 

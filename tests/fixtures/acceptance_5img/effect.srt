@@ -1,0 +1,25 @@
+﻿1
+00:00:00,000 --> 00:00:04,000
+DRAW 0s-2s:
+
+2
+00:00:04,000 --> 00:00:10,000
+MODE advanced_draw
+OBJECT_EFFECT target=title effect=draw
+OBJECT_EFFECT target=card_left effect=slide_in direction=left
+OBJECT_EFFECT target=card_right effect=slide_in direction=right
+
+3
+00:00:10,000 --> 00:00:15,000
+MODE basic_draw
+
+4
+00:00:15,000 --> 00:00:22,000
+MODE advanced_draw
+OBJECT_EFFECT target=alex effect=draw
+OBJECT_EFFECT target=warning effect=push_in direction=top
+CAMERA_AFTER object=warning action=focus target=warning framing=camera_frame persist=false
+
+5
+00:00:22,000 --> 00:00:27,000
+POST_MOTION subtle_zoom_in

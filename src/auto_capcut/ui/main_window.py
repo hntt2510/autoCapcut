@@ -100,7 +100,7 @@ class MainWindow(QMainWindow):
         self.image_list.model().rowsInserted.connect(lambda *_: self._image_list_changed()); self.image_list.model().rowsRemoved.connect(lambda *_: self._image_list_changed())
 
 
-        # ── DRAW ANIMATION group ──────────────────────────────────────────
+        # ── DRAW ANIMATION / SETUP group ─────────────────────────────────────
         draw_grp = QGroupBox("DRAW ANIMATION")
         draw_form = QFormLayout(draw_grp)
 
@@ -111,20 +111,34 @@ class MainWindow(QMainWindow):
         self.draw_scene_path = QLineEdit()
         draw_scene_browse = QPushButton("Browse")
         draw_scene_browse.clicked.connect(lambda: self._browse_file(self.draw_scene_path, "JSON files (*.json)"))
-        draw_scene_row = QHBoxLayout(); draw_scene_row.addWidget(self.draw_scene_path); draw_scene_row.addWidget(draw_scene_browse)
+        draw_scene_row = QHBoxLayout()
+        draw_scene_row.addWidget(self.draw_scene_path)
+        draw_scene_row.addWidget(draw_scene_browse)
         draw_form.addRow("Scene JSON:", draw_scene_row)
 
-        self.edit_draw_objects_btn = QPushButton("Edit Draw Objects")
-        self.edit_draw_objects_btn.clicked.connect(self._edit_draw_objects)
-        draw_form.addRow("", self.edit_draw_objects_btn)
+        # ── Per-image draw setup status panel (SRT-driven) ──────────────────
+        self.draw_setup_status = QLabel("DRAW SETUP\n\nAdd images and a Main Effect SRT first.")
+        self.draw_setup_status.setWordWrap(True)
+        self.draw_setup_status.setStyleSheet(
+            "font-family: monospace; font-size: 11px; background: #f8f8f8; "
+            "border: 1px solid #ddd; padding: 6px; color: #222;"
+        )
+        self.draw_setup_status.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        draw_form.addRow(self.draw_setup_status)
 
-        self.draw_scene_status = QLabel("Draw scene: not configured")
-        self.draw_scene_status.setWordWrap(True)
-        self.draw_scene_status.setStyleSheet("color: #444; padding: 2px 0;")
-        draw_form.addRow("Draw scene status:", self.draw_scene_status)
+        # ── Configure Advanced Images button ─────────────────────────────────
+        self.configure_advanced_btn = QPushButton("Configure Advanced Images")
+        self.configure_advanced_btn.clicked.connect(self._configure_advanced_images)
+        draw_form.addRow("", self.configure_advanced_btn)
 
+        # Keep legacy draw_scene_status for _update_enabled compat
+        self.draw_scene_status = self.draw_setup_status
+
+        # ── Debug / options ──────────────────────────────────────────────────
         self.draw_remove_bg = QCheckBox("Remove simple background")
-        self.draw_fallback_basic = QCheckBox("Fallback invalid advanced scenes to basic")
+        self.draw_fallback_basic = QCheckBox("Fallback invalid advanced scenes to basic (debug)")
         self.draw_fallback_basic.setChecked(True)
         self.draw_diagnostics = QCheckBox("Write draw diagnostics")
         self.draw_reuse_cache = QCheckBox("Reuse draw render cache")
@@ -140,6 +154,9 @@ class MainWindow(QMainWindow):
 
         self.draw_scene_path.textChanged.connect(lambda *_: self._update_draw_scene_status())
         self.draw_fallback_basic.toggled.connect(lambda *_: self._update_draw_scene_status())
+        # edit_draw_objects_btn alias removed; _update_enabled must not ref it
+        self.edit_draw_objects_btn = self.configure_advanced_btn  # alias for compat
+
 
 
 
@@ -168,79 +185,98 @@ class MainWindow(QMainWindow):
         self._update_draw_scene_status()
 
     def _update_draw_scene_status(self) -> None:
-        if not hasattr(self, "draw_scene_status"):
+        """Refresh the SRT-driven per-image draw setup status panel."""
+        if not hasattr(self, "draw_setup_status"):
             return
 
         images = self._current_images()
-        if not images:
-            self.draw_scene_status.setText("Draw scene: add image folder first")
-            return
-
-        scene_text = self.draw_scene_path.text().strip()
-        scene_doc = None
-        if scene_text:
-            path = Path(scene_text)
-            if path.is_file():
-                try:
-                    from auto_capcut.core.draw_scene import load_scene
-                    scene_doc = load_scene(path)
-                except Exception as exc:
-                    self.draw_scene_status.setText(f"Draw scene: invalid scene JSON ({exc})")
-                    return
-
-        # Check effect SRT for which images have advanced_draw cues
-        draw_cues_by_img: dict[str, str] = {}
         effect_text = self.effect_path.text().strip()
-        if effect_text and Path(effect_text).is_file():
+
+        if not images:
+            self.draw_setup_status.setText("DRAW SETUP\n\nAdd an image folder first.")
+            self.configure_advanced_btn.setText("Configure Advanced Images")
+            self.configure_advanced_btn.setEnabled(False)
+            return
+
+        if not effect_text or not Path(effect_text).is_file():
+            self.draw_setup_status.setText("DRAW SETUP\n\nSelect a Main Effect SRT first.")
+            self.configure_advanced_btn.setText("Configure Advanced Images")
+            self.configure_advanced_btn.setEnabled(False)
+            return
+
+        # Load scene doc (optional)
+        scene_doc = None
+        scene_text = self.draw_scene_path.text().strip()
+        if scene_text and Path(scene_text).is_file():
             try:
-                from auto_capcut.core.unified_effect_parser import parse_unified_effect
-                unified = parse_unified_effect(effect_text)
-                for cue in unified.cues:
-                    if cue.kind == "draw" and cue.draw_plan is not None:
-                        idx = cue.index - 1
-                        if 0 <= idx < len(images):
-                            draw_cues_by_img[images[idx].name.casefold()] = cue.draw_plan.mode.value
-            except Exception:
-                pass
+                from auto_capcut.core.draw_scene import load_scene
+                scene_doc = load_scene(Path(scene_text))
+            except Exception as exc:
+                self.draw_setup_status.setText(f"DRAW SETUP\n\nInvalid scene JSON: {exc}")
+                self.configure_advanced_btn.setEnabled(False)
+                return
 
-        configured_count = 0
-        fallback_enabled = self.draw_fallback_basic.isChecked()
-        lines: list[str] = []
+        # Analyze
+        try:
+            from auto_capcut.core.draw_setup import analyze_from_srt
+            summary = analyze_from_srt(images, effect_text, scene_doc)
+        except Exception as exc:
+            self.draw_setup_status.setText(f"DRAW SETUP\n\nSRT parse error: {exc}")
+            self.configure_advanced_btn.setEnabled(False)
+            return
 
-        for img in images:
-            key = img.name.casefold()
-            rec = None
-            if scene_doc and scene_doc.images:
-                rec = scene_doc.images.get(key)
-                if rec is None:
-                    for k, v in scene_doc.images.items():
-                        if k.casefold() == key or k == img.name:
-                            rec = v
-                            break
+        # Compose per-image status table
+        col_w = max(len(s.image_name) for s in summary.statuses) if summary.statuses else 8
+        lines = ["DRAW SETUP", ""]
+        for s in summary.statuses:
+            mode_str = "BASIC   " if s.is_basic else "ADVANCED"
+            ready_str = "Ready ✓" if s.is_ready else "Setup needed"
+            detail = "" if s.is_ready else f"  ← {s.message.replace('Setup needed — ', '')}"
+            lines.append(f"{s.image_name:<{col_w}}  {mode_str}  {ready_str}{detail}")
 
-            req_mode = draw_cues_by_img.get(key)
-            if rec:
-                configured_count += 1
-                obj_count = len(rec.objects)
-                cam_count = sum(1 for o in rec.objects if o.camera_frame is not None)
-                cam_str = f" / {cam_count} camera frame{'s' if cam_count != 1 else ''}" if cam_count else ""
-                lines.append(f"{img.name}: {obj_count} objects{cam_str}")
-            else:
-                if req_mode == "advanced_draw":
-                    if fallback_enabled:
-                        lines.append(f"{img.name}: advanced scene missing → will fallback to basic_draw")
-                    else:
-                        lines.append(f"{img.name}: advanced scene missing (blocking error)")
-                else:
-                    lines.append(f"{img.name}: not configured")
+        lines.append("")
+        lines.append(f"{summary.total} images  |  {summary.basic_count} Basic  |  {summary.advanced_count} Advanced")
+        if summary.advanced_count:
+            lines.append(f"{summary.advanced_ready} Advanced Ready  |  {summary.advanced_needs_setup} Needs Setup")
 
-        header = f"Draw scene: {len(images)} project images ({configured_count} configured)" if len(images) > 0 else "Draw scene: not configured"
-        self.draw_scene_status.setText(header + ("\n" + "\n".join(lines) if lines else ""))
+        self.draw_setup_status.setText("\n".join(lines))
+        self.draw_setup_status.setStyleSheet(
+            "font-family: monospace; font-size: 11px; background: #f8f8f8; "
+            "border: 1px solid #ddd; padding: 6px; color: #222;"
+        )
 
-    def _edit_draw_objects(self) -> None:
+        # Update configure button
+        n_missing = summary.advanced_needs_setup
+        n_adv = summary.advanced_count
+        if n_adv == 0:
+            self.configure_advanced_btn.setText("No advanced setup required ✓")
+            self.configure_advanced_btn.setEnabled(False)
+        elif n_missing == 0:
+            self.configure_advanced_btn.setText("Review Advanced Images")
+            self.configure_advanced_btn.setEnabled(True)
+        elif n_missing == 1:
+            self.configure_advanced_btn.setText("Configure 1 Advanced Image")
+            self.configure_advanced_btn.setEnabled(True)
+        else:
+            self.configure_advanced_btn.setText(f"Configure {n_missing} Advanced Images")
+            self.configure_advanced_btn.setEnabled(True)
+
+        # Store summary for quick preflight
+        self._draw_summary = summary
+
+
+
+
+    def _configure_advanced_images(self) -> None:
+        """Open the Draw Object Editor focused on incomplete advanced images.
+
+        Builds a queue of advanced images that are not ready, opens the editor
+        restricted to those images, starting at the first incomplete one.
+        When invoked as 'Review' (all ready), opens all advanced images.
+        """
         images = self._current_images()
         if not images:
-            QMessageBox.warning(self, "Draw Objects", "Add an image folder first.")
+            QMessageBox.warning(self, "Configure Advanced Images", "Add an image folder first.")
             return
 
         scene_text = self.draw_scene_path.text().strip()
@@ -258,11 +294,59 @@ class MainWindow(QMainWindow):
             self.settings.setValue("draw_scene_path", str(scene_path))
 
         resolution = RESOLUTIONS[self.resolution.currentText()]
+        canvas_size = (resolution.width, resolution.height)
+
+        # Get current summary (computed during status update)
+        summary = getattr(self, "_draw_summary", None)
+
+        # Determine queue
+        if summary is not None and summary.advanced_needs_setup > 0:
+            # Queue = incomplete advanced images only
+            incomplete = summary.incomplete_advanced
+            allowed_names = [s.image_name for s in incomplete]
+            # Required IDs context
+            req_ids: dict[str, list[str]] = {
+                s.image_name.casefold(): list(s.required_ids)
+                for s in incomplete
+            }
+            cam_ids: dict[str, set[str]] = {
+                s.image_name.casefold(): set(s.required_camera_frame_ids)
+                for s in incomplete
+            }
+            initial_idx = 0  # start at first incomplete
+        elif summary is not None and summary.advanced_count > 0:
+            # Review mode: all advanced images
+            advanced = summary.all_advanced
+            allowed_names = [s.image_name for s in advanced]
+            req_ids = {
+                s.image_name.casefold(): list(s.required_ids)
+                for s in advanced
+            }
+            cam_ids = {
+                s.image_name.casefold(): set(s.required_camera_frame_ids)
+                for s in advanced
+            }
+            initial_idx = 0
+        else:
+            # No SRT summary available — open all images (legacy fallback)
+            allowed_names = None
+            req_ids = {}
+            cam_ids = {}
+            initial_idx = 0
+
         from auto_capcut.ui.draw_animation import DrawObjectEditorDialog
-        dialog = DrawObjectEditorDialog(images, scene_path, (resolution.width, resolution.height), parent=self)
+        dialog = DrawObjectEditorDialog(
+            images,
+            scene_path,
+            canvas_size,
+            parent=self,
+            initial_image_index=initial_idx,
+            allowed_image_names=allowed_names,
+            required_ids_by_image=req_ids,
+            camera_frame_ids_by_image=cam_ids,
+        )
         dialog.exec()
         self._update_draw_scene_status()
-
 
     def _update_effect_status(self) -> None:
         path = Path(self.effect_path.text()) if self.effect_path.text() else None
@@ -271,14 +355,25 @@ class MainWindow(QMainWindow):
             return
         try:
             from auto_capcut.core.unified_effect_parser import parse_unified_effect
+            from auto_capcut.core.draw_models import DrawMode
             unified = parse_unified_effect(path)
             images = self._current_images()
             total_cues = len(unified.cues)
-            draw_count = len(unified.draw_plans)
-            cue_label = f"{total_cues} cues ({draw_count} draw)" if draw_count else f"{total_cues} cues"
-            self.effect_status.setText(f"{len(images)} images / {cue_label} {'✓' if len(images) == total_cues else '!'}")
+            draw_cues = [c for c in unified.cues if c.kind == "draw" and c.draw_plan is not None]
+            basic_count = sum(1 for c in draw_cues if c.draw_plan.mode is DrawMode.BASIC)
+            advanced_count = sum(1 for c in draw_cues if c.draw_plan.mode is DrawMode.ADVANCED)
+            match_icon = "✓" if len(images) == total_cues else "!"
+            lines = [
+                f"{len(images)} images / {total_cues} cues {match_icon}",
+                f"{basic_count} Basic Draw  |  {advanced_count} Advanced Draw",
+            ]
+            if unified.draw_warnings:
+                lines.append("Warnings: " + "; ".join(unified.draw_warnings[:2]))
+            self.effect_status.setText("\n".join(lines))
         except Exception as exc:
             self.effect_status.setText(f"Effect status: {exc}")
+
+
 
     def _update_enabled(self) -> None:
         self.motion_mode.setEnabled(self.motion_enabled.isChecked())
@@ -322,16 +417,66 @@ class MainWindow(QMainWindow):
         )
 
     def _create_project(self) -> None:
-        try: config = self._config()
-        except Exception as exc: QMessageBox.critical(self, "Invalid configuration", str(exc)); return
-        self.create_button.setEnabled(False); self.progress.setValue(0); self.status.setText("Starting...")
-        self.thread = QThread(); self.worker = ProjectWorker(config); self.worker.moveToThread(self.thread)
+        try:
+            config = self._config()
+        except Exception as exc:
+            QMessageBox.critical(self, "Invalid configuration", str(exc))
+            return
+
+        # ── Advanced draw setup preflight ─────────────────────────────────
+        # Only block if fallback_basic is NOT checked (strict mode)
+        if not self.draw_fallback_basic.isChecked():
+            summary = getattr(self, "_draw_summary", None)
+            if summary is None and config.effect_direction_srt and config.effect_direction_srt.is_file():
+                try:
+                    from auto_capcut.core.draw_setup import analyze_from_srt
+                    from auto_capcut.core.draw_scene import load_scene
+                    images = self._current_images()
+                    scene_doc = None
+                    if config.draw_scene_json and config.draw_scene_json.is_file():
+                        scene_doc = load_scene(config.draw_scene_json)
+                    summary = analyze_from_srt(images, config.effect_direction_srt, scene_doc)
+                except Exception:
+                    summary = None
+
+            if summary is not None and not summary.all_ready:
+                # Build detailed error message
+                detail_lines = ["Advanced draw setup incomplete:\n"]
+                for s in summary.incomplete_advanced:
+                    detail_lines.append(f"● {s.image_name}:")
+                    if s.missing_ids:
+                        detail_lines.append(f"   Missing objects: {', '.join(s.missing_ids)}")
+                    if s.missing_camera_frame_ids:
+                        detail_lines.append(f"   Camera frame missing: {', '.join(s.missing_camera_frame_ids)}")
+                    if not s.missing_ids and not s.missing_camera_frame_ids:
+                        detail_lines.append(f"   {s.message}")
+
+                msg = QMessageBox(self)
+                msg.setWindowTitle("Advanced Draw Setup Incomplete")
+                msg.setText("\n".join(detail_lines))
+                msg.setIcon(QMessageBox.Icon.Warning)
+                configure_btn = msg.addButton("Configure Advanced Images", QMessageBox.ButtonRole.ActionRole)
+                msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+                msg.exec()
+                if msg.clickedButton() is configure_btn:
+                    self._configure_advanced_images()
+                return
+
+        self.create_button.setEnabled(False)
+        self.progress.setValue(0)
+        self.status.setText("Starting...")
+        self.thread = QThread()
+        self.worker = ProjectWorker(config)
+        self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         self.worker.progress.connect(lambda v, m: (self.progress.setValue(v), self.status.setText(m)))
-        self.worker.finished.connect(self._on_finished); self.worker.failed.connect(self._on_failed)
-        self.worker.finished.connect(self.thread.quit); self.worker.failed.connect(self.thread.quit)
+        self.worker.finished.connect(self._on_finished)
+        self.worker.failed.connect(self._on_failed)
+        self.worker.finished.connect(self.thread.quit)
+        self.worker.failed.connect(self.thread.quit)
         self.thread.finished.connect(self._thread_finished)
         self.thread.start()
+
 
     def _on_finished(self, results: list) -> None: self.progress.setValue(100); self.status.setText(f"Project created successfully: {', '.join(result.project_name for result in results)}")
     def _on_failed(self, message: str) -> None:
