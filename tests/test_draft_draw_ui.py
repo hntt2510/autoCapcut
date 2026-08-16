@@ -294,3 +294,125 @@ def test_preflight_blocks_when_advanced_setup_missing(qt_app: QApplication, tmp_
 
     window.deleteLater()
 
+
+def test_preflight_blocks_on_stale_srt_when_effect_path_changes(qt_app: QApplication, tmp_path: Path) -> None:
+    """Changing effect_path to an SRT requiring new objects must block create without stale cached bypass."""
+    img_folder = tmp_path / "images"
+    images = _create_images(img_folder, 1)
+
+    # SRT A: requires only 'title'
+    srt_a = tmp_path / "effect_a.srt"
+    srt_a.write_text("1\n00:00:00,000 --> 00:00:02,000\nMODE advanced_draw\nOBJECT_EFFECT target=title effect=draw\n", encoding="utf-8")
+
+    # SRT B: requires 'title' AND 'warning'
+    srt_b = tmp_path / "effect_b.srt"
+    srt_b.write_text("1\n00:00:00,000 --> 00:00:02,000\nMODE advanced_draw\nOBJECT_EFFECT target=title effect=draw\nOBJECT_EFFECT target=warning effect=draw\n", encoding="utf-8")
+
+    # Scene JSON configured with only 'title'
+    scene_file = tmp_path / "draw_scene.json"
+    doc = SceneDocument(
+        schema_version=1,
+        images={"001.png": SceneImage("001.png", (1920, 1080), (
+            SceneObject("title", "art", NormalizedRect(0.1, 0.1, 0.2, 0.2)),
+        ), ("title",))},
+        path=scene_file,
+    )
+    save_scene(doc, scene_file)
+
+    window = MainWindow()
+    window.image_list.clear()
+    window.image_list.addItem(str(img_folder))
+    window.draw_scene_path.setText(str(scene_file))
+
+    # Load SRT A -> ready state
+    window.effect_path.setText(str(srt_a))
+    assert window._draw_summary is not None
+    assert window._draw_summary.all_ready is True
+
+    # Switch to SRT B (do NOT manually call _update_draw_scene_status)
+    window.effect_path.setText(str(srt_b))
+
+    # Trigger create -> must strictly block for missing 'warning'
+    with patch.object(QMessageBox, "exec") as mock_exec, patch.object(QMessageBox, "addButton"):
+        window._create_project()
+        assert mock_exec.called
+        assert window.worker is None
+
+    window.deleteLater()
+
+
+def test_preflight_fails_closed_on_invalid_scene_json(qt_app: QApplication, tmp_path: Path) -> None:
+    """Invalid/corrupt scene JSON must block project creation with a critical error (fail closed)."""
+    img_folder = tmp_path / "images"
+    images = _create_images(img_folder, 1)
+
+    srt = tmp_path / "effect.srt"
+    srt.write_text("1\n00:00:00,000 --> 00:00:02,000\nMODE advanced_draw\nOBJECT_EFFECT target=title effect=draw\n", encoding="utf-8")
+
+    scene_file = tmp_path / "draw_scene.json"
+    scene_file.write_text("{corrupt json content}", encoding="utf-8")
+
+    window = MainWindow()
+    window.image_list.clear()
+    window.image_list.addItem(str(img_folder))
+    window.effect_path.setText(str(srt))
+    window.draw_scene_path.setText(str(scene_file))
+
+    with patch.object(QMessageBox, "critical") as mock_crit:
+        window._create_project()
+        assert mock_crit.called
+        assert window.worker is None
+
+    window.deleteLater()
+
+
+def test_preflight_fails_closed_on_missing_or_malformed_srt(qt_app: QApplication, tmp_path: Path) -> None:
+    """Missing or malformed SRT must block project creation (fail closed)."""
+    img_folder = tmp_path / "images"
+    images = _create_images(img_folder, 1)
+
+    window = MainWindow()
+    window.image_list.clear()
+    window.image_list.addItem(str(img_folder))
+    window.effect_path.setText(str(tmp_path / "non_existent.srt"))
+
+    with patch.object(QMessageBox, "critical") as mock_crit:
+        window._create_project()
+        assert mock_crit.called
+        assert window.worker is None
+
+    window.deleteLater()
+
+
+def test_effect_path_text_changed_refreshes_draw_setup(qt_app: QApplication, tmp_path: Path) -> None:
+    """Updating effect_path text automatically triggers _update_draw_scene_status."""
+    img_folder = tmp_path / "images"
+    images = _create_images(img_folder, 2)
+
+    srt_basic = tmp_path / "basic.srt"
+    srt_basic.write_text("1\n00:00:00,000 --> 00:00:02,000\nMODE basic_draw\n\n2\n00:00:02,000 --> 00:00:04,000\nMODE basic_draw\n", encoding="utf-8")
+
+    srt_adv = tmp_path / "adv.srt"
+    srt_adv.write_text("1\n00:00:00,000 --> 00:00:02,000\nMODE advanced_draw\nOBJECT_EFFECT target=hero effect=draw\n\n2\n00:00:02,000 --> 00:00:04,000\nMODE basic_draw\n", encoding="utf-8")
+
+    window = MainWindow()
+    window.image_list.clear()
+    window.image_list.addItem(str(img_folder))
+
+    # Setting effect_path to basic.srt
+    window.effect_path.setText(str(srt_basic))
+    assert "2 Basic" in window.draw_setup_status.text()
+    assert "0 Advanced" in window.draw_setup_status.text()
+
+    # Setting effect_path to adv.srt updates status table automatically
+    window.effect_path.setText(str(srt_adv))
+    assert "1 Basic" in window.draw_setup_status.text()
+    assert "1 Advanced" in window.draw_setup_status.text()
+    assert "001.png" in window.draw_setup_status.text()
+    assert "ADVANCED" in window.draw_setup_status.text()
+    assert "Setup needed" in window.draw_setup_status.text()
+    assert "1 Needs Setup" in window.draw_setup_status.text()
+
+    window.deleteLater()
+
+

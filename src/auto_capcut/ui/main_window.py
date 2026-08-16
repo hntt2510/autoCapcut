@@ -96,7 +96,7 @@ class MainWindow(QMainWindow):
         self.create_button = QPushButton("CREATE CAPCUT PROJECT"); self.create_button.setMinimumHeight(42); self.create_button.clicked.connect(self._create_project); layout.addWidget(self.create_button); self.progress = QProgressBar(); self.status = QLabel("Ready"); self.status.setWordWrap(True); layout.addWidget(self.progress); layout.addWidget(self.status)
         for widget in (self.import_subtitles, self.motion_enabled, self.transition_enabled, self.logo_enabled, self.music_enabled, self.single_audio, self.folder_audio): widget.toggled.connect(self._update_enabled)
         self.motion_mode.currentTextChanged.connect(lambda *_: (self._update_enabled(), self._update_effect_status()))
-        self.effect_path.textChanged.connect(lambda *_: (self._update_enabled(), self._update_effect_status()))
+        self.effect_path.textChanged.connect(lambda *_: (self._update_enabled(), self._update_effect_status(), self._update_draw_scene_status()))
         self.image_list.model().rowsInserted.connect(lambda *_: self._image_list_changed()); self.image_list.model().rowsRemoved.connect(lambda *_: self._image_list_changed())
 
 
@@ -182,6 +182,7 @@ class MainWindow(QMainWindow):
 
     def _update_draw_scene_status(self) -> None:
         """Refresh the SRT-driven per-image draw setup status panel."""
+        self._draw_summary = None
         if not hasattr(self, "draw_setup_status"):
             return
 
@@ -203,7 +204,11 @@ class MainWindow(QMainWindow):
         # Load scene doc (optional)
         scene_doc = None
         scene_text = self.draw_scene_path.text().strip()
-        if scene_text and Path(scene_text).is_file():
+        if scene_text:
+            if not Path(scene_text).is_file():
+                self.draw_setup_status.setText(f"DRAW SETUP\n\nScene JSON file not found: {scene_text}")
+                self.configure_advanced_btn.setEnabled(False)
+                return
             try:
                 from auto_capcut.core.draw_scene import load_scene
                 scene_doc = load_scene(Path(scene_text))
@@ -257,7 +262,7 @@ class MainWindow(QMainWindow):
             self.configure_advanced_btn.setText(f"Configure {n_missing} Advanced Images")
             self.configure_advanced_btn.setEnabled(True)
 
-        # Store summary for quick preflight
+        # Store summary for UI queue actions
         self._draw_summary = summary
 
 
@@ -419,42 +424,46 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Invalid configuration", str(exc))
             return
 
-        # ── Advanced draw setup preflight (strict normal production) ─────
-        summary = getattr(self, "_draw_summary", None)
-        if summary is None and config.effect_direction_srt and config.effect_direction_srt.is_file():
+        # ── Advanced draw setup preflight (authoritative & fail-closed) ──
+        if config.effect_direction_srt:
             try:
-                from auto_capcut.core.draw_setup import analyze_from_srt
-                from auto_capcut.core.draw_scene import load_scene
+                if not config.effect_direction_srt.is_file():
+                    raise ValueError(f"Main Effect SRT file not found: {config.effect_direction_srt}")
                 images = self._current_images()
                 scene_doc = None
-                if config.draw_scene_json and config.draw_scene_json.is_file():
+                if config.draw_scene_json:
+                    if not config.draw_scene_json.is_file():
+                        raise ValueError(f"Scene JSON file not found: {config.draw_scene_json}")
+                    from auto_capcut.core.draw_scene import load_scene
                     scene_doc = load_scene(config.draw_scene_json)
+                from auto_capcut.core.draw_setup import analyze_from_srt
                 summary = analyze_from_srt(images, config.effect_direction_srt, scene_doc)
-            except Exception:
-                summary = None
+            except Exception as exc:
+                QMessageBox.critical(self, "Draw Setup Validation Failed", str(exc))
+                return
 
-        if summary is not None and not summary.all_ready:
-            # Build detailed error message
-            detail_lines = ["Advanced draw setup incomplete:\n"]
-            for s in summary.incomplete_advanced:
-                detail_lines.append(f"● {s.image_name}:")
-                if s.missing_ids:
-                    detail_lines.append(f"   Missing objects: {', '.join(s.missing_ids)}")
-                if s.missing_camera_frame_ids:
-                    detail_lines.append(f"   Camera frame missing: {', '.join(s.missing_camera_frame_ids)}")
-                if not s.missing_ids and not s.missing_camera_frame_ids:
-                    detail_lines.append(f"   {s.message}")
+            if not summary.all_ready:
+                # Build detailed error message
+                detail_lines = ["Advanced draw setup incomplete:\n"]
+                for s in summary.incomplete_advanced:
+                    detail_lines.append(f"● {s.image_name}:")
+                    if s.missing_ids:
+                        detail_lines.append(f"   Missing objects: {', '.join(s.missing_ids)}")
+                    if s.missing_camera_frame_ids:
+                        detail_lines.append(f"   Camera frame missing: {', '.join(s.missing_camera_frame_ids)}")
+                    if not s.missing_ids and not s.missing_camera_frame_ids:
+                        detail_lines.append(f"   {s.message}")
 
-            msg = QMessageBox(self)
-            msg.setWindowTitle("Advanced Draw Setup Incomplete")
-            msg.setText("\n".join(detail_lines))
-            msg.setIcon(QMessageBox.Icon.Warning)
-            configure_btn = msg.addButton("Configure Advanced Images", QMessageBox.ButtonRole.ActionRole)
-            msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
-            msg.exec()
-            if msg.clickedButton() is configure_btn:
-                self._configure_advanced_images()
-            return
+                msg = QMessageBox(self)
+                msg.setWindowTitle("Advanced Draw Setup Incomplete")
+                msg.setText("\n".join(detail_lines))
+                msg.setIcon(QMessageBox.Icon.Warning)
+                configure_btn = msg.addButton("Configure Advanced Images", QMessageBox.ButtonRole.ActionRole)
+                msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+                msg.exec()
+                if msg.clickedButton() is configure_btn:
+                    self._configure_advanced_images()
+                return
 
         self.create_button.setEnabled(False)
         self.progress.setValue(0)
