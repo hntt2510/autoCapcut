@@ -263,7 +263,7 @@ def test_draw_object_editor_auto_advances_queue_on_save(qt_app: QApplication, tm
 
 
 def test_preflight_blocks_when_advanced_setup_missing(qt_app: QApplication, tmp_path: Path) -> None:
-    """Preflight blocks project creation when an advanced_draw image is missing setup."""
+    """Preflight blocks project creation when an advanced_draw image is missing setup in default production UI."""
     img_folder = tmp_path / "images"
     images = _create_images(img_folder, 3)
 
@@ -276,11 +276,13 @@ def test_preflight_blocks_when_advanced_setup_missing(qt_app: QApplication, tmp_
     )
 
     window = MainWindow()
+    # Verify default UI-created ProjectConfig has draw_fallback_basic=False
+    assert window._config().draw_fallback_basic is False
+
     window.image_list.clear()
     window.image_list.addItem(str(img_folder))
     window.effect_path.setText(str(effect_file))
     window.draw_scene_path.setText("")
-    window.draw_fallback_basic.setChecked(False)  # strict production mode
     window._update_draw_scene_status()
 
     # Preflight should show QMessageBox warning and not start worker

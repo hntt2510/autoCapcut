@@ -138,13 +138,10 @@ class MainWindow(QMainWindow):
 
         # ── Debug / options ──────────────────────────────────────────────────
         self.draw_remove_bg = QCheckBox("Remove simple background")
-        self.draw_fallback_basic = QCheckBox("Fallback invalid advanced scenes to basic (debug)")
-        self.draw_fallback_basic.setChecked(True)
         self.draw_diagnostics = QCheckBox("Write draw diagnostics")
         self.draw_reuse_cache = QCheckBox("Reuse draw render cache")
         self.draw_reuse_cache.setChecked(True)
         draw_form.addRow(self.draw_remove_bg)
-        draw_form.addRow(self.draw_fallback_basic)
         draw_form.addRow(self.draw_diagnostics)
         draw_form.addRow(self.draw_reuse_cache)
 
@@ -153,7 +150,6 @@ class MainWindow(QMainWindow):
         layout.insertWidget(transitions_index + 1, draw_grp)
 
         self.draw_scene_path.textChanged.connect(lambda *_: self._update_draw_scene_status())
-        self.draw_fallback_basic.toggled.connect(lambda *_: self._update_draw_scene_status())
         # edit_draw_objects_btn alias removed; _update_enabled must not ref it
         self.edit_draw_objects_btn = self.configure_advanced_btn  # alias for compat
 
@@ -382,7 +378,7 @@ class MainWindow(QMainWindow):
         self.transition_type.setEnabled(self.transition_enabled.isChecked())
         self.transition_duration.setEnabled(self.transition_enabled.isChecked())
         self.audio_path.setPlaceholderText("Folder containing audio files" if self.folder_audio.isChecked() else "Audio file")
-        for w in (self.draw_source_label, self.draw_scene_path, self.edit_draw_objects_btn, self.draw_scene_status, self.draw_remove_bg, self.draw_fallback_basic, self.draw_diagnostics, self.draw_reuse_cache):
+        for w in (self.draw_source_label, self.draw_scene_path, self.edit_draw_objects_btn, self.draw_scene_status, self.draw_remove_bg, self.draw_diagnostics, self.draw_reuse_cache):
             w.setEnabled(True)
 
     def _config(self) -> ProjectConfig:
@@ -411,7 +407,7 @@ class MainWindow(QMainWindow):
             draw_enabled=True,
             draw_scene_json=Path(self.draw_scene_path.text()) if self.draw_scene_path.text() else None,
             draw_remove_background=self.draw_remove_bg.isChecked(),
-            draw_fallback_basic=self.draw_fallback_basic.isChecked(),
+            draw_fallback_basic=False,
             draw_diagnostics=self.draw_diagnostics.isChecked(),
             draw_reuse_cache=self.draw_reuse_cache.isChecked(),
         )
@@ -423,44 +419,42 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Invalid configuration", str(exc))
             return
 
-        # ── Advanced draw setup preflight ─────────────────────────────────
-        # Only block if fallback_basic is NOT checked (strict mode)
-        if not self.draw_fallback_basic.isChecked():
-            summary = getattr(self, "_draw_summary", None)
-            if summary is None and config.effect_direction_srt and config.effect_direction_srt.is_file():
-                try:
-                    from auto_capcut.core.draw_setup import analyze_from_srt
-                    from auto_capcut.core.draw_scene import load_scene
-                    images = self._current_images()
-                    scene_doc = None
-                    if config.draw_scene_json and config.draw_scene_json.is_file():
-                        scene_doc = load_scene(config.draw_scene_json)
-                    summary = analyze_from_srt(images, config.effect_direction_srt, scene_doc)
-                except Exception:
-                    summary = None
+        # ── Advanced draw setup preflight (strict normal production) ─────
+        summary = getattr(self, "_draw_summary", None)
+        if summary is None and config.effect_direction_srt and config.effect_direction_srt.is_file():
+            try:
+                from auto_capcut.core.draw_setup import analyze_from_srt
+                from auto_capcut.core.draw_scene import load_scene
+                images = self._current_images()
+                scene_doc = None
+                if config.draw_scene_json and config.draw_scene_json.is_file():
+                    scene_doc = load_scene(config.draw_scene_json)
+                summary = analyze_from_srt(images, config.effect_direction_srt, scene_doc)
+            except Exception:
+                summary = None
 
-            if summary is not None and not summary.all_ready:
-                # Build detailed error message
-                detail_lines = ["Advanced draw setup incomplete:\n"]
-                for s in summary.incomplete_advanced:
-                    detail_lines.append(f"● {s.image_name}:")
-                    if s.missing_ids:
-                        detail_lines.append(f"   Missing objects: {', '.join(s.missing_ids)}")
-                    if s.missing_camera_frame_ids:
-                        detail_lines.append(f"   Camera frame missing: {', '.join(s.missing_camera_frame_ids)}")
-                    if not s.missing_ids and not s.missing_camera_frame_ids:
-                        detail_lines.append(f"   {s.message}")
+        if summary is not None and not summary.all_ready:
+            # Build detailed error message
+            detail_lines = ["Advanced draw setup incomplete:\n"]
+            for s in summary.incomplete_advanced:
+                detail_lines.append(f"● {s.image_name}:")
+                if s.missing_ids:
+                    detail_lines.append(f"   Missing objects: {', '.join(s.missing_ids)}")
+                if s.missing_camera_frame_ids:
+                    detail_lines.append(f"   Camera frame missing: {', '.join(s.missing_camera_frame_ids)}")
+                if not s.missing_ids and not s.missing_camera_frame_ids:
+                    detail_lines.append(f"   {s.message}")
 
-                msg = QMessageBox(self)
-                msg.setWindowTitle("Advanced Draw Setup Incomplete")
-                msg.setText("\n".join(detail_lines))
-                msg.setIcon(QMessageBox.Icon.Warning)
-                configure_btn = msg.addButton("Configure Advanced Images", QMessageBox.ButtonRole.ActionRole)
-                msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
-                msg.exec()
-                if msg.clickedButton() is configure_btn:
-                    self._configure_advanced_images()
-                return
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Advanced Draw Setup Incomplete")
+            msg.setText("\n".join(detail_lines))
+            msg.setIcon(QMessageBox.Icon.Warning)
+            configure_btn = msg.addButton("Configure Advanced Images", QMessageBox.ButtonRole.ActionRole)
+            msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+            msg.exec()
+            if msg.clickedButton() is configure_btn:
+                self._configure_advanced_images()
+            return
 
         self.create_button.setEnabled(False)
         self.progress.setValue(0)
@@ -496,7 +490,6 @@ class MainWindow(QMainWindow):
             # Draw Animation settings
             "draw_scene_path": self.draw_scene_path.text(),
             "draw_remove_bg": self.draw_remove_bg.isChecked(),
-            "draw_fallback_basic": self.draw_fallback_basic.isChecked(),
             "draw_diagnostics": self.draw_diagnostics.isChecked(),
             "draw_reuse_cache": self.draw_reuse_cache.isChecked(),
         }
@@ -509,6 +502,7 @@ class MainWindow(QMainWindow):
         self.settings.remove("timing_path")
         self.settings.remove("draw_effect_path")
         self.settings.remove("draw_enabled")
+        self.settings.remove("draw_fallback_basic")
         self.project_name.setText(self.settings.value("project_name", "")); resolution = self.settings.value("resolution", "1920x1080"); index = self.resolution.findText(str(resolution)); self.resolution.setCurrentIndex(index if index >= 0 else 0)
         for key, widget in (("audio_path", self.audio_path), ("subtitle_path", self.subtitle_path), ("logo_path", self.logo_path), ("music_path", self.music_path), ("draft_path", self.draft_path)): widget.setText(str(self.settings.value(key, widget.text())))
         self.effect_path.setText(str(self.settings.value("effect_path", ""))); saved_mode = str(self.settings.value("motion_mode", "Random Light")); legacy = {"Random": "Random Light", "Zoom In": "Subtle Zoom In", "Zoom Out": "Subtle Zoom Out", "Pan Left": "Subtle Pan Left", "Pan Right": "Subtle Pan Right"}; saved_mode = legacy.get(saved_mode, saved_mode); self.motion_mode.setCurrentText(saved_mode if self.motion_mode.findText(saved_mode) >= 0 else "Random Light"); self.motion_strength.setCurrentText(str(self.settings.value("motion_strength", MotionStrength.SUBTLE.value))); self.motion_enabled.setChecked(self.settings.value("motion_enabled", True, type=bool)); self.transition_enabled.setChecked(self.settings.value("transition_enabled", True, type=bool)); image_folder = str(self.settings.value("image_folder", ""));
@@ -516,7 +510,6 @@ class MainWindow(QMainWindow):
         # Draw Animation settings
         self.draw_scene_path.setText(str(self.settings.value("draw_scene_path", "")))
         self.draw_remove_bg.setChecked(self.settings.value("draw_remove_bg", False, type=bool))
-        self.draw_fallback_basic.setChecked(self.settings.value("draw_fallback_basic", True, type=bool))
         self.draw_diagnostics.setChecked(self.settings.value("draw_diagnostics", False, type=bool))
         self.draw_reuse_cache.setChecked(self.settings.value("draw_reuse_cache", True, type=bool))
         self._update_draw_scene_status()

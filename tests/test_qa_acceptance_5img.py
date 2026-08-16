@@ -92,11 +92,11 @@ def test_section_16_qa_complete_workflow(qt_app: QApplication, tmp_path: Path) -
 
     # 4. Instantiate MainWindow & wire up paths
     window = MainWindow()
+    assert window._config().draw_fallback_basic is False
     window.image_list.clear()
     window.image_list.addItem(str(img_dir))
     window.effect_path.setText(str(srt_file))
     window.draw_scene_path.setText(str(scene_file))
-    window.draw_fallback_basic.setChecked(False)  # strict preflight
 
     window._update_draw_scene_status()
     status_text = window.draw_setup_status.text()
