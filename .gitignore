@@ -6,3 +6,6 @@ __pycache__/
 build/
 dist/
 scratch/
+.autocapcut_draw_cache/
+*.mp4
+*.roi.json
